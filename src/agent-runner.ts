@@ -357,6 +357,29 @@ export function getGraceTurns(): number { return graceTurns; }
 /** Set the grace turns value (minimum 1). */
 export function setGraceTurns(n: number): void { graceTurns = Math.max(1, n); }
 
+/** Shared rules file; unset or empty disables injection. */
+let subagentInstructionsFile: string | undefined;
+
+export function getSubagentInstructionsFile(): string | undefined { return subagentInstructionsFile; }
+export function setSubagentInstructionsFile(file: string | undefined): void { subagentInstructionsFile = file; }
+
+/** Read fresh at session creation; an unreadable configured file fails the spawn. */
+export function readSubagentInstructions(configured: string, configCwd: string): string | undefined {
+  if (!configured) return undefined;
+  const path = configured === "~" || configured.startsWith("~/")
+    ? resolve(homedir(), configured.slice(2))
+    : resolve(configCwd, configured);
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf-8");
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    throw new Error(`subagentInstructionsFile "${configured}" could not be read (${path}): ${reason}`);
+  }
+  const content = raw.replace(/^\uFEFF/, "").trim();
+  return content.length > 0 ? content : undefined;
+}
+
 /**
  * Try to find the right model for an agent type.
  * Priority: explicit option > config.model > parent model.
@@ -631,6 +654,9 @@ export async function runAgent(
   const extras: PromptExtras = {};
   if (options.worktreeBase) extras.worktreeBase = options.worktreeBase;
   if (options.workflow && !options.structuredOutput) extras.workflowChild = true;
+
+  // All spawn paths share this runner, including isolated and workflow children.
+  extras.instructionsBlock = readSubagentInstructions(subagentInstructionsFile ?? "", configCwd);
 
   // Resolve extensions/skills: isolated overrides to false
   const extensions = options.isolated ? false : config.extensions;

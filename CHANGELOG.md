@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Shared subagent rules via `subagentInstructionsFile`.** Set this field in global or project `subagents.json` to a Markdown file to inject it into every new child session, including nested, workflow and isolated agents, without replacing their roles or tool scopes. Unset is off; a project-level empty string disables a global path, and an unreadable configured file fails the spawn. The file is read afresh for each new session; an in-memory resume keeps its original prompt.
+
 ### Fixed
 - **The workflow stand-down now recognises a lowercase `workflow` tool** ([#283](https://github.com/tintinweb/pi-subagents/issues/283) — thanks [@zampierilucas](https://github.com/zampierilucas)). The match is exact on purpose, and the set held `Workflow` and `SubagentWorkflow` only, so `@quintinshaw/pi-dynamic-workflows` — which registers lowercase `workflow` — never tripped it: with `workflowsEnabled` unset, both orchestrators reached the model and nothing warned. Adding the third name is the whole fix; exactness is kept, so a `list_workflows` still cannot take the feature down.
 

@@ -10,6 +10,8 @@ export interface PromptExtras {
   memoryBlock?: string;
   /** Preloaded skill contents to inject. */
   skillBlocks?: { name: string; content: string }[];
+  /** Shared rules from subagentInstructionsFile, injected in both prompt modes. */
+  instructionsBlock?: string;
   /**
    * Parent directory the worktree copy was created from. Set only for
    * `isolation: "worktree"` spawns — triggers the block that tells the agent
@@ -86,8 +88,19 @@ Return only the answer, in exactly the shape the prompt asks for — no preamble
 </workflow_child>`
     : "";
 
+  // Nested append-mode agents may already inherit the exact shared rules.
+  const instructionsBlock = extras?.instructionsBlock
+    ? `<subagent_instructions>\n${extras.instructionsBlock}\n</subagent_instructions>`
+    : "";
+  const instructionsAlreadyInherited = config.promptMode === "append"
+    && !!parentSystemPrompt
+    && parentSystemPrompt.includes(instructionsBlock);
+
   // Build optional extras suffix
   const extraSections: string[] = [];
+  if (instructionsBlock && !instructionsAlreadyInherited) {
+    extraSections.push(instructionsBlock);
+  }
   if (extras?.memoryBlock) {
     extraSections.push(extras.memoryBlock);
   }

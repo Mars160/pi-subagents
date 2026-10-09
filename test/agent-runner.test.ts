@@ -129,6 +129,7 @@ import {
   getGraceTurns,
   parseExtensionsSpec,
   parseExtSelectors,
+  readSubagentInstructions,
   resolveDefaultModel,
   resolveEffectiveMaxTurns,
   resumeAgent,
@@ -137,7 +138,9 @@ import {
   setDefaultMaxTurns,
   setGraceTurns,
   setRememberAgents,
+  setSubagentInstructionsFile,
 } from "../src/agent-runner.js";
+import { buildAgentPrompt } from "../src/prompts.js";
 import { compileJsonSchema } from "../src/workflow/json-schema.js";
 
 /** The most recent session built by `createSession` — read by `lastToolsPassed()`. */
@@ -2732,5 +2735,111 @@ describe("resolveDefaultModel", () => {
 
   it("returns undefined when neither a config model nor a parent model exists", () => {
     expect(resolveDefaultModel(undefined, registry([haiku]), undefined)).toBeUndefined();
+  });
+});
+
+// `subagentInstructionsFile`: the runner reads the configured file once per new
+// session and hands its body to the prompt builder. The builder's own rendering
+// and nested dedupe are covered in prompts.test.ts; what is checked here is the
+// read, the path resolution and the failure mode.
+describe("shared subagent instructions", () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "pi-instructions-"));
+  });
+
+  afterEach(() => {
+    setSubagentInstructionsFile(undefined);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** The `extras` argument the runner passed to the (mocked) prompt builder. */
+  function extrasOf() {
+    return vi.mocked(buildAgentPrompt).mock.lastCall?.[4];
+  }
+
+  async function run(options: Record<string, unknown> = {}) {
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    await runAgent(ctx, "Explore", "do it", { pi, ...options });
+  }
+
+  it("expands ~, resolves relative paths against configCwd, and returns undefined when unset", () => {
+    expect(readSubagentInstructions("", "/proj")).toBeUndefined();
+    // A missing file names the expanded, resolved path — enough to prove both
+    // branches of the resolution without a home directory to write into.
+    const missing = join(homedir(), "pi-instructions-does-not-exist.md");
+    expect(() => readSubagentInstructions("~/pi-instructions-does-not-exist.md", "/proj")).toThrow(missing);
+    expect(() => readSubagentInstructions("rules.md", "/proj")).toThrow("/proj/rules.md");
+  });
+
+  it("reads the configured file and strips the BOM and outer whitespace", async () => {
+    writeFileSync(join(dir, "rules.md"), "\uFEFF\n  Always run the tests.  \n");
+    setSubagentInstructionsFile(join(dir, "rules.md"));
+
+    await run();
+
+    expect(await extrasOf()).toMatchObject({ instructionsBlock: "Always run the tests." });
+  });
+
+  it("resolves a relative path against configCwd, not the working directory", async () => {
+    // The agent may run in a worktree or a caller-supplied target whose `.pi`
+    // is not the project's; the file is project config, so it follows configCwd.
+    writeFileSync(join(dir, "rules.md"), "CONFIG RULES");
+    setSubagentInstructionsFile("rules.md");
+    const elsewhere = mkdtempSync(join(tmpdir(), "pi-instructions-cwd-"));
+    try {
+      await run({ cwd: elsewhere, configCwd: dir });
+      expect(await extrasOf()).toMatchObject({ instructionsBlock: "CONFIG RULES" });
+    } finally {
+      rmSync(elsewhere, { recursive: true, force: true });
+    }
+  });
+
+  it("fails the spawn when a configured file cannot be read", async () => {
+    setSubagentInstructionsFile(join(dir, "missing.md"));
+
+    await expect(run()).rejects.toThrow(/subagentInstructionsFile ".*missing\.md" could not be read/);
+  });
+
+  it("injects nothing for an empty or whitespace-only file", async () => {
+    writeFileSync(join(dir, "empty.md"), "\n\uFEFF   \n");
+    setSubagentInstructionsFile(join(dir, "empty.md"));
+
+    await run();
+
+    expect((await extrasOf())?.instructionsBlock).toBeUndefined();
+  });
+
+  it("re-reads the file for each session, so an edit reaches the next spawn", async () => {
+    const file = join(dir, "rules.md");
+    writeFileSync(file, "FIRST");
+    setSubagentInstructionsFile(file);
+
+    await run();
+    expect(await extrasOf()).toMatchObject({ instructionsBlock: "FIRST" });
+
+    writeFileSync(file, "SECOND");
+    await run();
+    expect(await extrasOf()).toMatchObject({ instructionsBlock: "SECOND" });
+  });
+
+  it("treats an empty string as the off switch", async () => {
+    setSubagentInstructionsFile("");
+
+    await run();
+
+    expect((await extrasOf())?.instructionsBlock).toBeUndefined();
+  });
+
+  it("applies to isolated, workflow and nested spawns alike", async () => {
+    writeFileSync(join(dir, "rules.md"), "RULES");
+    setSubagentInstructionsFile(join(dir, "rules.md"));
+
+    for (const options of [{ isolated: true }, { workflow: true }, { nested: true }]) {
+      await run(options);
+      expect(await extrasOf()).toMatchObject({ instructionsBlock: "RULES" });
+    }
   });
 });

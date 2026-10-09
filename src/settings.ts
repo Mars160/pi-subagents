@@ -265,6 +265,14 @@ export interface SubagentsSettings {
    */
   reportUsage?: boolean;
   /**
+   * Shared Markdown rules for every new subagent session. Unset = off;
+   * `""` overrides a global path to disable injection for this project.
+   * Supports absolute paths, `~/`, and paths relative to configCwd.
+   * Read fresh per session; unreadable configured files fail the spawn.
+   * Instructions only — does not change tool permissions.
+   */
+  subagentInstructionsFile?: string;
+  /**
    * Whether the subagent surfaces show an estimated dollar cost next to their
    * token counts (widget, FleetView, conversation viewer, foreground results,
    * completion notifications). Defaults to `false`. Applied live.
@@ -328,6 +336,7 @@ export interface SettingsAppliers {
   setWorkflowsEnabled: (b: boolean) => void;
   setMaxSubagentDepth: (n: number) => void;
   setFallbackSubagent: (v: string | undefined) => void;
+  setSubagentInstructionsFile: (v: string | undefined) => void;
   setReportUsage: (b: boolean) => void;
   setShowCost: (b: boolean) => void;
   setShowModel: (b: boolean) => void;
@@ -461,6 +470,10 @@ function sanitize(raw: unknown): SubagentsSettings {
   } else if (typeof r.fallbackSubagent === "string" && r.fallbackSubagent.trim()) {
     out.fallbackSubagent = r.fallbackSubagent.trim();
   }
+  if (typeof r.subagentInstructionsFile === "string") {
+    // Keep empty strings so a project can disable the global file.
+    out.subagentInstructionsFile = r.subagentInstructionsFile.trim();
+  }
   return out;
 }
 
@@ -519,6 +532,9 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.graceTurns === "number") appliers.setGraceTurns(s.graceTurns);
   if (typeof s.maxSubagentDepth === "number") appliers.setMaxSubagentDepth(s.maxSubagentDepth);
   if (typeof s.fallbackSubagent === "string") appliers.setFallbackSubagent(s.fallbackSubagent);
+  if (typeof s.subagentInstructionsFile === "string") {
+    appliers.setSubagentInstructionsFile(s.subagentInstructionsFile);
+  }
   if (s.defaultJoinMode) appliers.setDefaultJoinMode(s.defaultJoinMode);
   if (typeof s.backgroundByDefault === "boolean") appliers.setBackgroundByDefault(s.backgroundByDefault);
   if (typeof s.schedulingEnabled === "boolean") appliers.setSchedulingEnabled(s.schedulingEnabled);

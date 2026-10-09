@@ -82,6 +82,21 @@ describe("settings persistence", () => {
     });
   });
 
+  it("round-trips subagentInstructionsFile, including the empty-string opt-out", () => {
+    saveSettings({ subagentInstructionsFile: ".pi/rules.md" }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ subagentInstructionsFile: ".pi/rules.md" });
+    // "" is a real value (project-level opt-out), not an absent field, so it
+    // has to survive the sanitizer and the write.
+    saveSettings({ subagentInstructionsFile: "" }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ subagentInstructionsFile: "" });
+  });
+
+  it("lets a project disable a global instructions file with an empty string", () => {
+    writeGlobal({ subagentInstructionsFile: "~/.pi/house-rules.md" });
+    writeProject({ subagentInstructionsFile: "" });
+    expect(loadSettings(projectDir)).toEqual({ subagentInstructionsFile: "" });
+  });
+
   it("round-trips values: saveSettings then loadSettings", () => {
     const settings = {
       maxConcurrent: 7,
@@ -363,6 +378,24 @@ describe("settings persistence", () => {
       expect(loadSettings(projectDir)).toEqual({});
     });
 
+    it("keeps a subagentInstructionsFile path, and an explicit empty string", () => {
+      writeProject({ subagentInstructionsFile: "  .pi/rules.md  " });
+      expect(loadSettings(projectDir)).toEqual({ subagentInstructionsFile: ".pi/rules.md" });
+      writeProject({ subagentInstructionsFile: "" });
+      expect(loadSettings(projectDir)).toEqual({ subagentInstructionsFile: "" });
+      // Whitespace-only is the same opt-out as "".
+      writeProject({ subagentInstructionsFile: "   " });
+      expect(loadSettings(projectDir)).toEqual({ subagentInstructionsFile: "" });
+    });
+
+    it("drops non-string subagentInstructionsFile values without coercing them", () => {
+      // String(["a.md"]) is "a.md" — coercing would silently enable the file.
+      for (const junk of [["a.md"], null, 42, true, {}]) {
+        writeProject({ subagentInstructionsFile: junk });
+        expect(loadSettings(projectDir)).toEqual({});
+      }
+    });
+
     it("drops invalid defaultJoinMode values", () => {
       writeProject({ defaultJoinMode: "invalid" });
       expect(loadSettings(projectDir)).toEqual({});
@@ -555,6 +588,7 @@ describe("settings persistence", () => {
         setReportUsage: vi.fn(),
         setShowCost: vi.fn(),
         setShowModel: vi.fn(),
+        setSubagentInstructionsFile: vi.fn(),
       };
     });
 
@@ -721,6 +755,15 @@ describe("settings persistence", () => {
       expect(appliers.setWorktreeIsolation).toHaveBeenCalledWith(true);
     });
 
+    it("applies subagentInstructionsFile, including the empty-string opt-out", () => {
+      applySettings({ subagentInstructionsFile: "rules.md" }, appliers);
+      expect(appliers.setSubagentInstructionsFile).toHaveBeenCalledWith("rules.md");
+      applySettings({ subagentInstructionsFile: "" }, appliers);
+      expect(appliers.setSubagentInstructionsFile).toHaveBeenCalledWith("");
+      applySettings({}, appliers);
+      expect(appliers.setSubagentInstructionsFile).toHaveBeenCalledTimes(2); // absence is "use default"
+    });
+
     it("applies defaultMaxTurns: 0 as the explicit unlimited marker", () => {
       applySettings({ defaultMaxTurns: 0 }, appliers);
       expect(appliers.setDefaultMaxTurns).toHaveBeenCalledWith(0);
@@ -806,6 +849,7 @@ describe("settings persistence", () => {
         setReportUsage: vi.fn(),
         setShowCost: vi.fn(),
         setShowModel: vi.fn(),
+        setSubagentInstructionsFile: vi.fn(),
       };
     });
 

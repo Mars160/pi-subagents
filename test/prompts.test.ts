@@ -486,4 +486,82 @@ describe("buildAgentPrompt", () => {
       expect(prompt.indexOf("<workflow_child>")).toBeGreaterThan(prompt.indexOf("<worktree_isolation>"));
     });
   });
+
+  // Shared house rules from `subagentInstructionsFile`: rendered in both prompt
+  // modes, and NOT rendered a second time into a nested child that already
+  // inherited its parent subagent's copy.
+  describe("shared instructions block", () => {
+    function instructionsConfig(promptMode: "append" | "replace"): AgentConfig {
+      return {
+        name: "test-agent",
+        description: "Test",
+        builtinToolNames: [],
+        extensions: true,
+        skills: true,
+        systemPrompt: "Custom instructions.",
+        promptMode,
+        inheritContext: false,
+        runInBackground: false,
+        isolated: false,
+      };
+    }
+
+    const rules = "Always run the linter before claiming done.";
+    const rendered = `<subagent_instructions>\n${rules}\n</subagent_instructions>`;
+
+    it("is absent when the setting produced no content", () => {
+      for (const promptMode of ["replace", "append"] as const) {
+        const prompt = buildAgentPrompt(instructionsConfig(promptMode), "/workspace", env, "Parent.", {});
+        expect(prompt).not.toContain("<subagent_instructions>");
+      }
+    });
+
+    it("renders in append mode, after the cacheable inherited prefix", () => {
+      const prompt = buildAgentPrompt(instructionsConfig("append"), "/workspace", env, "Parent prompt.", {
+        instructionsBlock: rules,
+      });
+      expect(prompt).toContain(rendered);
+      expect(prompt.startsWith("Parent prompt.")).toBe(true);
+      expect(prompt.indexOf("<subagent_instructions>")).toBeGreaterThan(prompt.indexOf("<sub_agent_context>"));
+    });
+
+    it("renders in replace mode too — isolation is not an exemption", () => {
+      const prompt = buildAgentPrompt(instructionsConfig("replace"), "/workspace", env, undefined, {
+        instructionsBlock: rules,
+      });
+      expect(prompt).toContain(rendered);
+    });
+
+    it("does not append a second copy when the inherited prompt already has the block", () => {
+      const parent = buildAgentPrompt(instructionsConfig("append"), "/workspace", env, "Parent.", {
+        instructionsBlock: rules,
+      });
+      const child = buildAgentPrompt(instructionsConfig("append"), "/workspace", env, parent, {
+        instructionsBlock: rules,
+      });
+      // split() on an exact one-occurrence string returns two parts.
+      expect(child.split(rendered)).toHaveLength(2);
+    });
+
+    it("still renders when the inherited prompt carries a DIFFERENT rules file", () => {
+      const parent = buildAgentPrompt(instructionsConfig("append"), "/workspace", env, "Parent.", {
+        instructionsBlock: "Old rules.",
+      });
+      const child = buildAgentPrompt(instructionsConfig("append"), "/workspace", env, parent, {
+        instructionsBlock: rules,
+      });
+      expect(child).toContain(rendered);
+      expect(child).toContain("<subagent_instructions>\nOld rules.\n</subagent_instructions>");
+    });
+
+    it("is not deduped in replace mode, which inherits no parent prompt", () => {
+      const parentWithBlock = buildAgentPrompt(instructionsConfig("append"), "/workspace", env, "Parent.", {
+        instructionsBlock: rules,
+      });
+      const child = buildAgentPrompt(instructionsConfig("replace"), "/workspace", env, parentWithBlock, {
+        instructionsBlock: rules,
+      });
+      expect(child).toContain(rendered);
+    });
+  });
 });

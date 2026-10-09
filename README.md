@@ -40,7 +40,7 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 ## Install
 
 ```bash
-pi install npm:@tintinweb/pi-subagents
+pi install git:github.com/Mars160/pi-subagents
 ```
 
 Or load directly for development:
@@ -616,6 +616,20 @@ Runtime tuning values set via `/agents` → Settings (max concurrency, max foreg
 - **Project:** `<cwd>/.pi/subagents.json` — per-project overrides. Written by `/agents` → Settings.
 
 **Precedence:** project overrides global on any field present in both. Missing fields fall back to the hardcoded defaults (max concurrency `10`, max foreground concurrency `0` = unlimited, default max turns unlimited, grace turns `5`, nested depth `2`, join mode `smart`, defaults enabled).
+
+**Shared subagent instructions** (`subagentInstructionsFile`, default unset/off): a Markdown file added to every newly created subagent's system prompt, including ordinary, nested, workflow and `isolated` agents. Configure it by hand in `subagents.json`; it is not a `/agents` menu option. To use one global rules file across projects, add this field to `~/.pi/agent/subagents.json` (preserving your other settings):
+
+```json
+{
+  "subagentInstructionsFile": "~/.pi/agent/SUBAGENT_AGENTS.md"
+}
+```
+
+Create that Markdown file with your shared rules, or point the setting at your existing `~/.pi/agent/AGENTS.md`. Absolute paths are accepted; `~/` expands to your home directory. Relative paths resolve against the agent's **config directory** (`configCwd`), not a caller-supplied working directory. For worktree isolation, that config directory may be the worktree copy; use an absolute or `~/` path for a machine-wide file.
+
+The file is read afresh when a child session is created. Changes to its contents reach the next new session; changes to the configured path take effect when settings reload (normally the next pi session). Resuming an existing in-memory child keeps its original prompt; reopening a persisted session builds a new prompt with the current rules. Unset or `""` disables injection; a project-level `""` overrides a global path. A blank file adds nothing; a configured file that cannot be read fails the spawn rather than silently omitting the rules.
+
+Rules appear in a `<subagent_instructions>` section in both `append` and `replace` modes without replacing the agent's identity, tools, memory or skills. Nested append-mode agents do not duplicate an identical inherited section. This is prompt guidance, **not a permissions sandbox**, and it applies only to children created by this extension.
 
 **Nested depth** (`maxSubagentDepth`, default `2`): the hard ceiling on [nested delegation](#nested-subagents), counted from the main session (main = 0, its subagents = 1). `0` or `1` disables nesting project-wide regardless of any agent's `allowed_subagents`. Read when a subagent session is built, so a change applies to agents started after it.
 
