@@ -24,6 +24,7 @@ import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, get
 import { inChildSessionContext } from "./child-context.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
+import type { GenerationStats } from "./generation.js";
 import { GroupJoinManager } from "./group-join.js";
 import { isolationParam, resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
 import { describeMention, handleBase, isReservedHandle, parseMention, resolveHandleToType, stripAgentPrefix } from "./mention.js";
@@ -47,6 +48,7 @@ import {
   fgPreservingNestedStyles,
   formatCost,
   formatDuration,
+  formatGenerationTps,
   formatMs,
   formatTokens,
   formatTurns,
@@ -202,7 +204,7 @@ function formatTaskNotification(record: AgentRecord, resultMaxLen: number, showC
 /** Build AgentDetails from a base + record-specific fields. */
 function buildDetails(
   base: Pick<AgentDetails, "displayName" | "description" | "subagentType" | "modelName" | "tags">,
-  record: { toolUses: number; startedAt: number; completedAt?: number; status: string; error?: string; id?: string; session?: any; lifetimeUsage: LifetimeUsage },
+  record: { toolUses: number; startedAt: number; completedAt?: number; status: string; error?: string; id?: string; session?: any; lifetimeUsage: LifetimeUsage; generation?: GenerationStats },
   activity?: AgentActivity,
   overrides?: Partial<AgentDetails>,
 ): AgentDetails {
@@ -214,6 +216,9 @@ function buildDetails(
     // but a cost is joined by "·" in one surface, "," in another and "|" in a
     // third — so it travels as a number and each renderer punctuates its own.
     cost: getLifetimeCost(record.lifetimeUsage),
+    // The counters the tokens/sec rate is derived from, likewise raw so each
+    // surface decides whether and where to print the rate.
+    generation: record.generation,
     turnCount: activity?.turnCount,
     maxTurns: activity?.maxTurns,
     durationMs: (record.completedAt ?? Date.now()) - record.startedAt,
@@ -1694,6 +1699,8 @@ Terse command-style prompts produce shallow, generic work.
           const costText = formatCost(d.cost ?? 0);
           if (costText) parts.push(costText);
         }
+        const tps = formatGenerationTps(d.generation);
+        if (tps) parts.push(tps);
         return parts.map(p => fgPreservingNestedStyles(theme, "dim", p)).join(" " + theme.fg("dim", "·") + " ");
       };
 
@@ -2014,7 +2021,7 @@ Terse command-style prompts produce shallow, generic work.
             (isQueued ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
             `\nYou will be notified when this agent completes.\n` +
             `Use get_subagent_result to retrieve full results, or steer_subagent to send it messages.`,
-            { ...detailBaseFor(record), toolUses: record.toolUses, tokens: "", durationMs: 0, status: "background" as const, agentId: id },
+            { ...detailBaseFor(record), toolUses: record.toolUses, tokens: "", durationMs: 0, status: "background" as const, agentId: id, generation: record.generation },
           );
         }
 
@@ -2120,7 +2127,7 @@ Terse command-style prompts produce shallow, generic work.
           `\nYou will be notified when this agent completes.\n` +
           `Use get_subagent_result to retrieve full results, or steer_subagent to send it messages.\n` +
           `Do not duplicate this agent's work.`,
-          { ...detailBaseFor(record), toolUses: 0, tokens: "", durationMs: 0, status: "background" as const, agentId: id },
+          { ...detailBaseFor(record), toolUses: 0, tokens: "", durationMs: 0, status: "background" as const, agentId: id, generation: record?.generation },
         );
       }
 
@@ -2145,6 +2152,7 @@ Terse command-style prompts produce shallow, generic work.
           cost: fgRecord ? getLifetimeCost(fgRecord.lifetimeUsage) : 0,
           turnCount: fgState.turnCount,
           maxTurns: fgState.maxTurns,
+          generation: fgRecord?.generation,
           durationMs: Date.now() - startedAt,
           // Deliberately still "running" while queued: the renderer routes any
           // status it doesn't know to raw text (see the catch-all below), which

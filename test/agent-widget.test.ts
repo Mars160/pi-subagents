@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { renderRunningAgentStatus } from "../src/index.js";
 import type { WidgetMode } from "../src/types.js";
-import { type AgentActivity, AgentWidget, fgPreservingNestedStyles, formatCost, formatSessionTokens } from "../src/ui/agent-widget.js";
+import { type AgentActivity, AgentWidget, fgPreservingNestedStyles, formatCost, formatGenerationTps, formatSessionTokens } from "../src/ui/agent-widget.js";
 
 describe("formatSessionTokens", () => {
   const theme = { fg: (c: string, s: string) => `<${c}>${s}</${c}>`, bold: (s: string) => s };
@@ -163,13 +163,15 @@ describe("AgentWidget", () => {
       .toContain("sonnet 4.6 · thinking: high");
   });
 
-  it("renders the row exactly as before when showModel is off", () => {
+  it("hides the model but keeps the thinking level when showModel is off", () => {
     const manager = { listAgents: () => [makeRecord("bg", { isBackground: true })] };
 
     const off = renderLines(manager, "bg", () => "background");
     expect(off).toContain("bg description");
     expect(off).not.toContain("sonnet 4.6");
-    expect(off).not.toContain("thinking:");
+    // The level describes the run, not the model choice, so it is not gated by
+    // the `showModel` setting that hides the model name.
+    expect(off).toContain("thinking: high");
   });
 
   it("carries the short label, never the canonical id, onto the row", () => {
@@ -186,6 +188,34 @@ describe("AgentWidget", () => {
 
     expect(renderLines(manager, "bg", () => "background", true))
       .toContain("haiku 4.5 · thinking: high (asked max)");
+  });
+
+  it("shows the generation rate on a running row", () => {
+    const record = { ...makeRecord("bg", { isBackground: true }), generation: { outputTokens: 421, durationMs: 10_000 } };
+    const manager = { listAgents: () => [record] };
+
+    expect(renderLines(manager, "bg", () => "background")).toContain("42.1 tok/s");
+  });
+
+  it("fabricates no rate on a row with no generation counters", () => {
+    const manager = { listAgents: () => [makeRecord("bg", { isBackground: true })] };
+
+    expect(renderLines(manager, "bg", () => "background")).not.toContain("tok/s");
+  });
+
+  it("shows the thinking level and generation rate on a finished row", () => {
+    // Finished rows carry no activity entry, so both figures must come from the
+    // record — the same reason cost survives here.
+    const finished = {
+      ...makeRecord("done", { isBackground: true }),
+      status: "completed",
+      completedAt: Date.now(),
+      generation: { outputTokens: 421, durationMs: 10_000 },
+    };
+    const out = renderLines({ listAgents: () => [finished] }, "done", () => "background");
+
+    expect(out).toContain("thinking: high");
+    expect(out).toContain("42.1 tok/s");
   });
 
   // Queued agents stay a one-line count. A fan-out of ten would otherwise eat
@@ -233,6 +263,25 @@ describe("AgentWidget", () => {
 // footer under-reports and — worse — the queue vanishes from the UI entirely.
 // That happens exactly when the concurrency limit is saturated, i.e. when the
 // queue is the thing the user most needs to see.
+describe("formatGenerationTps", () => {
+  it("formats tokens per second to one decimal", () => {
+    expect(formatGenerationTps({ outputTokens: 421, durationMs: 10_000 })).toBe("42.1 tok/s");
+    expect(formatGenerationTps({ outputTokens: 1000, durationMs: 3000 })).toBe("333.3 tok/s");
+  });
+
+  it("shows nothing rather than fabricating a rate", () => {
+    // A record that reported no successful assistant message has 0 tokens, and
+    // "0.0 tok/s" would claim a rate was measured and found to be nothing.
+    expect(formatGenerationTps(undefined)).toBe("");
+    expect(formatGenerationTps({ outputTokens: 0, durationMs: 1000 })).toBe("");
+    expect(formatGenerationTps({ outputTokens: 100, durationMs: 0 })).toBe("");
+    expect(formatGenerationTps({ outputTokens: -5, durationMs: 1000 })).toBe("");
+    expect(formatGenerationTps({ outputTokens: 100, durationMs: -1 })).toBe("");
+    expect(formatGenerationTps({ outputTokens: Number.NaN, durationMs: 1000 })).toBe("");
+    expect(formatGenerationTps({ outputTokens: 100, durationMs: Number.POSITIVE_INFINITY })).toBe("");
+  });
+});
+
 describe("formatCost", () => {
   it("keeps the precision that distinguishes one run from another", () => {
     // Rounding to cents would print the same figure for a run that cost four

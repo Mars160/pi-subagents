@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Subagent generation TPS and always-visible thinking levels.** Agent rows show provider-reported output tokens per second of measured streaming generation time, excluding tool execution and time-to-first-token. Statistics survive resumes and exclude nested agents' usage; unavailable timing is omitted. The effective thinking level is shown independently of `showModel`; TPS is client-observed throughput, not server-side decoder telemetry.
 - **Shared subagent rules via `subagentInstructionsFile`.** Set this field in global or project `subagents.json` to a Markdown file to inject it into every new child session, including nested, workflow and isolated agents, without replacing their roles or tool scopes. Unset is off; a project-level empty string disables a global path, and an unreadable configured file fails the spawn. The file is read afresh for each new session; an in-memory resume keeps its original prompt.
 
 ### Fixed

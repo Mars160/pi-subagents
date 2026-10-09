@@ -121,6 +121,12 @@ The extension renders a persistent widget above the editor showing active agents
 └─ 2 queued
 ```
 
+Agent rows also show the effective **`thinking: high`** level (including `off`) and measured **`42.1 tok/s`** generation throughput. Thinking is independent of the `showModel` toggle. Generation throughput appears in the widget (running and finished), FleetView, conversation viewer and inline Agent results once a successful assistant message has completed.
+
+**TPS measurement:** provider-reported output tokens divided by the sum of client-observed generation intervals, from the first non-empty text, thinking or tool-call-argument delta to the end of each successful assistant message. This excludes time-to-first-token, tool execution, queueing, retry backoff and failed/aborted messages; input/cache tokens and nested agents' usage are never counted. It is a duration-weighted conversation average across turns and resumes, refreshed at message completion and retained while tools run, not an instantaneous per-delta rate. Missing usage or timing produces no TPS field rather than a fabricated zero.
+
+This is **observed streaming throughput**, not server-side decoder telemetry: network buffering and stream-finalization latency can affect it. Provider output usage may include hidden reasoning tokens even when reasoning deltas are not exposed; those providers cannot supply an exact reasoning-inclusive generation rate through this API.
+
 The token field is annotated with two optional signals inside parens:
 - **`NN%`** — context-window utilization (color-coded: <70% dim, 70–85% warning, ≥85% error). Omitted when the model has no declared `contextWindow`, or briefly right after compaction.
 - **`⇊N`** — number of times the session has compacted, when > 0. Stays dim; the percent's color carries urgency.
@@ -666,13 +672,13 @@ The `~` marks it as pi's estimate rather than a billed figure. **A cost is shown
 
 Independent of `reportUsage`: this one is what you read, that one is what your session counts. Toggle via `/agents → Settings → Show cost`; applied live.
 
-**Show model** (`showModel`, default `false`): whether the widget's running rows name the model driving each agent and the thinking level it is running at:
+**Show model** (`showModel`, default `false`): whether the widget's running rows name the model driving each agent. The effective thinking level is always shown when known, independently of this toggle:
 
 ```text
 ├─ ⠹ Explore  inspect code · sonnet 4.6 · thinking: high · ↻3 · 8.2k token · 4.1s
 ```
 
-Off by default because the row already carries the description, turns, tool uses, tokens and elapsed time, and every character it gains is one the description loses on a narrow terminal. The other surfaces show the pair either way: the `Agent` tool result names the model beside its tags, and the conversation viewer's `↳` row spells out the canonical `provider/model-id`.
+Model names are off by default because the row already carries the description, thinking level, turns, tool uses, tokens, TPS and elapsed time, and every character it gains is one the description loses on a narrow terminal. The other surfaces show the pair either way: the `Agent` tool result names the model beside its tags, and the conversation viewer's `↳` row spells out the canonical `provider/model-id`.
 
 Both places report what the run *actually* used, read back from the child session once pi has resolved its defaults and clamped the level to what the model supports — not what the call asked for. Where those differ, the request is kept beside the effective value rather than dropped, whether pi clamped it or an agent file's frontmatter outranked it:
 
@@ -969,6 +975,7 @@ src/
   group-join.ts       # Group join manager: batched completion notifications with timeout
   status-note.ts      # Honest status note + salvaged partial output for non-normal outcomes
   usage.ts            # Token usage shapes, accumulators, session-stats readers
+  generation.ts       # Per-message streaming generation timing and local TPS totals
 
   # Invocation surface
   invocation-config.ts # Shared tool-parameter schemas (isolation, join, thinking, ...)

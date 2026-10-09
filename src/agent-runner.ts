@@ -22,6 +22,7 @@ import { runInChildSessionContext } from "./child-context.js";
 import { buildParentContext, extractText } from "./context.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
+import { type GenerationStats, subscribeGeneration } from "./generation.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
@@ -493,6 +494,8 @@ export interface RunOptions {
    * or reports traces back to this field.
    */
   onAssistantUsage?: (usage: LifetimeUsage) => void;
+  /** Called for each successful assistant stream with measured generation timing. */
+  onGeneration?: (stats: GenerationStats) => void;
   /**
    * Called when the session successfully compacts. `tokensBefore` is upstream's
    * pre-compaction context size estimate. Aborted compactions don't fire.
@@ -1120,6 +1123,7 @@ export async function runAgent(
   });
 
   const collector = collectResponseText(session);
+  const cleanupGeneration = options.onGeneration ? subscribeGeneration(session, options.onGeneration) : () => {};
   const cleanupAbort = forwardAbortSignal(session, options.signal);
 
   // Build the effective prompt: optionally prepend parent context
@@ -1150,6 +1154,7 @@ export async function runAgent(
     }
   } finally {
     unsubTurns();
+    cleanupGeneration();
     collector.unsubscribe();
     cleanupAbort();
   }
@@ -1183,6 +1188,7 @@ export async function resumeAgent(
   options: {
     onToolActivity?: (activity: ToolActivity) => void;
     onAssistantUsage?: (usage: LifetimeUsage) => void;
+    onGeneration?: (stats: GenerationStats) => void;
     onCompaction?: (info: { reason: "manual" | "threshold" | "overflow"; tokensBefore: number }) => void;
     signal?: AbortSignal;
   } = {},
@@ -1192,6 +1198,7 @@ export async function resumeAgent(
   // — a failed resume must not surface the previous turn's answer (#144).
   const startLen = session.messages.length;
   const collector = collectResponseText(session);
+  const cleanupGeneration = options.onGeneration ? subscribeGeneration(session, options.onGeneration) : () => {};
   const cleanupAbort = forwardAbortSignal(session, options.signal);
 
   const unsubEvents = (options.onToolActivity || options.onAssistantUsage || options.onCompaction)
@@ -1218,6 +1225,7 @@ export async function resumeAgent(
     await session.prompt(prompt);
   } finally {
     collector.unsubscribe();
+    cleanupGeneration();
     unsubEvents();
     cleanupAbort();
   }

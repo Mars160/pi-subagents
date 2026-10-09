@@ -177,6 +177,26 @@ describe("ConversationViewer cost display", () => {
   });
 });
 
+describe("ConversationViewer generation rate", () => {
+  /** The overlay's header for a record carrying `generation`. */
+  function header(generation?: { outputTokens: number; durationMs: number }): string {
+    const viewer = new ConversationViewer(
+      mockTui(30, 200), mockSession([]), mockRecord({ generation }), undefined,
+      { fg: (_c: string, t: string) => t, bold: (t: string) => t },
+      vi.fn(),
+    );
+    return viewer.render(200).join("\n");
+  }
+
+  it("shows the rate beside the elapsed clock", () => {
+    expect(header({ outputTokens: 421, durationMs: 10_000 })).toContain("42.1 tok/s");
+  });
+
+  it("shows no rate for a record without counters", () => {
+    expect(header(undefined)).not.toContain("tok/s");
+  });
+});
+
 describe("ConversationViewer", () => {
   it("closes with Ctrl+C when not composing", () => {
     const done = vi.fn();

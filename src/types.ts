@@ -4,6 +4,7 @@
 
 import type { ThinkingLevel } from "@earendil-works/pi-ai";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
+import type { GenerationStats } from "./generation.js";
 import type { LifetimeUsage } from "./usage.js";
 
 export type { ThinkingLevel };
@@ -225,6 +226,8 @@ export interface AgentRecord {
    * excluded — see issue #38). Initialized to zeros at spawn.
    */
   lifetimeUsage: LifetimeUsage;
+  /** Local successful stream timing across this conversation, including resumes. */
+  generation?: GenerationStats;
   /** Number of times this agent's session has compacted. Initialized to 0 at spawn. */
   compactionCount: number;
   /**

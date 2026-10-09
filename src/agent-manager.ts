@@ -20,6 +20,7 @@ import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
+import { addGeneration } from "./generation.js";
 import { assignHandle, handleBase } from "./mention.js";
 import { describeModel } from "./model-resolver.js";
 import type { AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, SubagentType, ThinkingLevel } from "./types.js";
@@ -787,6 +788,7 @@ export class AgentManager {
       },
       onTurnEnd: options.onTurnEnd,
       onTextDelta: options.onTextDelta,
+      onGeneration: (stats) => { record.generation = addGeneration(record.generation, stats); },
       onAssistantUsage: (usage) => {
         addUsage(record.lifetimeUsage, usage);
         this.onUsage?.(record, usage);
@@ -1175,6 +1177,7 @@ export class AgentManager {
 
     try {
       const { text, failure } = await resumeAgent(record.session, prompt, {
+        onGeneration: (stats) => { record.generation = addGeneration(record.generation, stats); },
         onToolActivity: (activity) => {
           if (activity.type === "end") record.toolUses++;
           options?.onToolActivity?.(activity);
@@ -1266,6 +1269,7 @@ export class AgentManager {
     };
 
     const promise = resumeAgent(record.session, prompt, {
+      onGeneration: (stats) => { record.generation = addGeneration(record.generation, stats); },
       onToolActivity: (activity) => {
         if (activity.type === "end") record.toolUses++;
         options.onToolActivity?.(activity);

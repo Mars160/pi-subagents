@@ -613,6 +613,32 @@ describe("FleetList cost display", () => {
   });
 });
 
+describe("FleetList thinking and generation display", () => {
+  /** The rendered row for one record. */
+  function row(over: Partial<AgentRecord>): string {
+    const h = harness([makeRecord({ id: "a1", description: "one", ...over })]);
+    return h.render().find(l => l.includes("one")) ?? "";
+  }
+
+  it("shows the level the run used", () => {
+    expect(row({ invocation: { modelName: "sonnet 4.6", thinking: "high" } as AgentRecord["invocation"] }))
+      .toContain("thinking: high");
+  });
+
+  it("discloses a level the run did not honor", () => {
+    expect(row({ invocation: { thinking: "low", requestedThinking: "max" } as AgentRecord["invocation"] }))
+      .toContain("thinking: low (asked max)");
+  });
+
+  it("shows the generation rate when the record has counters", () => {
+    expect(row({ generation: { outputTokens: 421, durationMs: 10_000 } })).toContain("42.1 tok/s");
+  });
+
+  it("fabricates no rate for a record with no counters", () => {
+    expect(row({})).not.toContain("tok/s");
+  });
+});
+
 /* ------------------------------------------------------------------------- *
  * Workflow runs
  * ------------------------------------------------------------------------- */

@@ -16,7 +16,7 @@ import { hasAgentBadge, renderAgentName } from "../agent-color.js";
 import { type AgentManager, isTopLevelAgent } from "../agent-manager.js";
 import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
 import { getLifetimeCost, getLifetimeTotal } from "../usage.js";
-import { type AgentActivity, formatCost, type Theme } from "./agent-widget.js";
+import { type AgentActivity, buildInvocationTags, formatCost, formatGenerationTps, type Theme } from "./agent-widget.js";
 import { ConversationViewer, VIEWPORT_HEIGHT_PCT } from "./conversation-viewer.js";
 
 /** Widget key for the below-editor fleet list. */
@@ -536,7 +536,14 @@ export class FleetList {
     const tokens = getLifetimeTotal(record.lifetimeUsage);
     const elapsedMs = (record.completedAt ?? Date.now()) - record.startedAt; // freezes once finished
     const cost = this.showCost() ? formatCost(getLifetimeCost(record.lifetimeUsage)) : "";
-    const stats = `${formatFleetElapsed(elapsedMs)} · ${formatFleetTokens(tokens)}${cost ? ` · ${cost}` : ""}`;
+    // The level the run actually used, and never gated by `showModel` — the
+    // fleet row has no model switch, and the level is what the row is for. From
+    // buildInvocationTags so a level pi clamped keeps its "(asked X)" note.
+    const thinkingTag = buildInvocationTags(record.invocation).tags.find(tag => tag.startsWith("thinking: "));
+    const tps = formatGenerationTps(record.generation);
+    const stats = [formatFleetElapsed(elapsedMs), formatFleetTokens(tokens), cost, thinkingTag, tps]
+      .filter(Boolean)
+      .join(" · ");
     const right = selected ? theme.fg("text", stats) : theme.fg("dim", stats);
     return rightAlign(left, right, width);
   }

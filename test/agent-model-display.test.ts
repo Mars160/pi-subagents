@@ -310,6 +310,34 @@ describe("Agent tool result — effective model", () => {
   });
 });
 
+describe("Agent tool result — generation rate", () => {
+  // Rendered straight from `details`: the counters travel on the record and the
+  // inline card is where they become a rate. No run is needed to exercise it.
+  const result = (generation?: { outputTokens: number; durationMs: number }) => ({
+    content: [{ type: "text", text: "done" }],
+    details: {
+      displayName: "General-purpose agent",
+      description: "d",
+      subagentType: "general-purpose",
+      toolUses: 2,
+      tokens: "1.2k token",
+      durationMs: 12_000,
+      status: "completed",
+      generation,
+    },
+  });
+
+  it("shows the rate in the stats the orchestrator reads", () => {
+    const tool = agentTool();
+    expect(render(tool, result({ outputTokens: 421, durationMs: 10_000 }))).toContain("42.1 tok/s");
+  });
+
+  it("shows no rate when the record reported no counters", () => {
+    const tool = agentTool();
+    expect(render(tool, result(undefined))).not.toContain("tok/s");
+  });
+});
+
 describe("Agent tool result — resume", () => {
   it("renders the reopened session's settings, not the resume call's", async () => {
     // resumeAgent only prompts the existing session: model and thinking on a
