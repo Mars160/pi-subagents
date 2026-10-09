@@ -1134,8 +1134,14 @@ export default function (pi: ExtensionAPI) {
   // everything else; "off" = hide the widget entirely. Read live at render time.
   let widgetMode: WidgetMode = "background";
   function getWidgetMode(): WidgetMode { return widgetMode; }
-  const widget = new AgentWidget(manager, agentActivity, getWidgetMode, isShowCostEnabled, isShowModelEnabled);
+  // Custom `description · stats` template for the widget's rows. Config file
+  // only (`widgetStatusTemplate`) — no `/agents → Settings` editor. Read live
+  // at render time; undefined/blank keeps the built-in body.
+  let widgetStatusTemplate: string | undefined;
+  function getWidgetStatusTemplate(): string | undefined { return widgetStatusTemplate; }
+  const widget = new AgentWidget(manager, agentActivity, getWidgetMode, isShowCostEnabled, isShowModelEnabled, getWidgetStatusTemplate);
   function setWidgetMode(m: WidgetMode): void { widgetMode = m; widget.update(); }
+  function setWidgetStatusTemplate(v: string | undefined): void { widgetStatusTemplate = v; widget.update(); }
 
   // Claude Code-style FleetView: navigable list of main + subagents below the editor.
   // The last two arguments keep a conversation overlay opened here identical to
@@ -1431,6 +1437,7 @@ export default function (pi: ExtensionAPI) {
       setReportUsage,
       setShowCost,
       setShowModel,
+      setWidgetStatusTemplate,
       setViewerMarkdown,
     },
     (event, payload) => pi.events.emit(event, payload),
@@ -3489,6 +3496,9 @@ Write the file using the write tool. Only write the file, nothing else.`;
       reportUsage: isReportUsageEnabled(),
       showCost: isShowCostEnabled(),
       showModel: isShowModelEnabled(),
+      // Raw, not `?? ""`: an unset template stays unset (dropped by
+      // JSON.stringify), while "" is a real value that clears a global one.
+      widgetStatusTemplate: getWidgetStatusTemplate(),
       viewerMarkdown: getViewerMarkdown(),
     } satisfies SubagentsSettings;
   }

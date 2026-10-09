@@ -688,6 +688,32 @@ Both places report what the run *actually* used, read back from the child sessio
 
 Toggle via `/agents → Settings → Show model`; applied live.
 
+**Widget status template** (`widgetStatusTemplate`, default unset): customize the description and statistics on the above-editor Widget's running and finished agent rows. Configure it by hand in global or project `subagents.json`; restart pi to reload file changes. It does not affect FleetView, tool results, the conversation viewer, or the footer status. The agent badge, status icon, activity line and queued summary stay unchanged.
+
+```json
+{
+  "widgetStatusTemplate": "${task_title} · ${model} · thinking: ${effort} · ${round} · ${tool_uses_count} tool uses · ${total_token} · ${tps} tok/s · ${time}"
+}
+```
+
+| Variable | Value |
+|---|---|
+| `${task_title}` | Task description |
+| `${model}` | Effective short model label, e.g. `sonnet 4.6` |
+| `${model_id}` | Effective canonical model ID, e.g. `anthropic/claude-sonnet-4-6` |
+| `${effort}` | Effective thinking level, without the `thinking:` prefix |
+| `${round}` | Formatted turn counter, e.g. `↻3≤20`, when available |
+| `${tool_uses_count}` | Tool-use count, including `0` |
+| `${total_token}` | Compact lifetime token count, e.g. `8.2k token` (excludes cache reads) |
+| `${tps}` | Measured generation rate, e.g. `42.1`, without the `tok/s` suffix |
+| `${time}` | Elapsed duration, e.g. `4.1s` |
+| `${cost}` | Estimated cost, e.g. `~$0.0042`, when priced |
+| `${status}` | Agent status, e.g. `running` or `completed` |
+
+Model and effort values retain an `(asked …)` annotation when the request was not honored. Explicit `${model}` and `${cost}` variables display independently of `showModel` and `showCost`. Missing values become empty strings; surrounding literal text and separators remain, so unavailable TPS in the example leaves `tok/s` without a number. Unknown placeholders remain literal. Substitution is non-recursive and does not execute JavaScript; newlines and tabs become spaces to keep the row single-line, and the result is truncated to terminal width.
+
+Unset, empty or whitespace-only templates preserve the existing display exactly. A project-level `""` overrides a global template to restore the default for that project. Changing unrelated menu settings preserves the configured template.
+
 **Viewer markdown** (`viewerMarkdown`, default `"assistant"`): how much of the [conversation viewer](#ui)'s transcript is rendered as Markdown rather than shown verbatim.
 
 ```text

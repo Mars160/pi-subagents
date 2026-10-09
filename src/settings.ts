@@ -298,6 +298,22 @@ export interface SubagentsSettings {
    */
   showModel?: boolean;
   /**
+   * Custom status-line template for the widget's running and finished agent
+   * rows. Undefined (the default) renders the built-in body; a template
+   * replaces only the `description · stats` part, keeping the row's
+   * icon/name/mode prefix, activity line, queue summary and status suffix.
+   * `""` is preserved so a project file can clear a globally configured
+   * template; unset, empty and whitespace-only all fall back to the default.
+   *
+   * Config file only — there is no `/agents → Settings` editor for it.
+   * Placeholders: `${task_title}`, `${model}`, `${model_id}`, `${effort}`,
+   * `${round}`, `${tool_uses_count}`, `${total_token}`, `${tps}`, `${time}`,
+   * `${cost}`, `${status}`. Unknown placeholders are kept verbatim; a value
+   * with no data is the empty string. `${model}`/`${cost}` are not gated by
+   * `showModel`/`showCost` — naming the variable is the opt-in. Applied live.
+   */
+  widgetStatusTemplate?: string;
+  /**
    * How much of the conversation viewer's transcript renders as Markdown.
    * Defaults to `assistant`. Applied live — the viewer's `m` key cycles this
    * same setting, so a choice made in the overlay persists like one made in
@@ -340,6 +356,7 @@ export interface SettingsAppliers {
   setReportUsage: (b: boolean) => void;
   setShowCost: (b: boolean) => void;
   setShowModel: (b: boolean) => void;
+  setWidgetStatusTemplate: (v: string | undefined) => void;
   setViewerMarkdown: (mode: ViewerMarkdownMode) => void;
 }
 
@@ -454,6 +471,12 @@ function sanitize(raw: unknown): SubagentsSettings {
   if (typeof r.showModel === "boolean") {
     out.showModel = r.showModel;
   }
+  if (typeof r.widgetStatusTemplate === "string") {
+    // Kept verbatim, including "": an empty string is how a project clears a
+    // globally configured template, and blank templates fall back at render
+    // time anyway. Not trimmed — a template's own spacing is the user's.
+    out.widgetStatusTemplate = r.widgetStatusTemplate;
+  }
   if (typeof r.viewerMarkdown === "string" && VALID_VIEWER_MARKDOWN_MODES.has(r.viewerMarkdown)) {
     out.viewerMarkdown = r.viewerMarkdown as ViewerMarkdownMode;
   }
@@ -551,6 +574,9 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.reportUsage === "boolean") appliers.setReportUsage(s.reportUsage);
   if (typeof s.showCost === "boolean") appliers.setShowCost(s.showCost);
   if (typeof s.showModel === "boolean") appliers.setShowModel(s.showModel);
+  if (typeof s.widgetStatusTemplate === "string") {
+    appliers.setWidgetStatusTemplate(s.widgetStatusTemplate);
+  }
   if (s.viewerMarkdown) appliers.setViewerMarkdown(s.viewerMarkdown);
   if (typeof s.workflowsEnabled === "boolean") appliers.setWorkflowsEnabled(s.workflowsEnabled);
 }

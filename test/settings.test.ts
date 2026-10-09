@@ -1,3 +1,5 @@
+// biome-ignore-all lint/suspicious/noTemplateCurlyInString: the `${...}` placeholder text is the literal subject under test, not a missing interpolation.
+
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -234,6 +236,26 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({ showModel: false });
     writeProject({ showModel: "on" } as any);
     expect(loadSettings(projectDir)).toEqual({});
+  });
+
+  it("round-trips widgetStatusTemplate; keeps the empty-string clear, drops non-string", () => {
+    saveSettings({ widgetStatusTemplate: "${task_title} ${round}" }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ widgetStatusTemplate: "${task_title} ${round}" });
+    // "" is a real value (a project clearing a global template), not an
+    // absent field, so it has to survive the sanitizer and the write.
+    saveSettings({ widgetStatusTemplate: "" }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ widgetStatusTemplate: "" });
+    writeProject({ widgetStatusTemplate: 42 });
+    expect(loadSettings(projectDir)).toEqual({}); // non-string dropped
+  });
+
+  it("lets a project clear a global template, and keeps a template's own spacing", () => {
+    writeGlobal({ widgetStatusTemplate: "${model}" });
+    writeProject({ widgetStatusTemplate: "" });
+    expect(loadSettings(projectDir)).toEqual({ widgetStatusTemplate: "" });
+    // Not trimmed: internal and edge spacing belongs to the user's template.
+    writeProject({ widgetStatusTemplate: "  ${task_title}  " });
+    expect(loadSettings(projectDir)).toEqual({ widgetStatusTemplate: "  ${task_title}  " });
   });
 
   it("round-trips workflowsEnabled; drops non-boolean", () => {
@@ -588,6 +610,7 @@ describe("settings persistence", () => {
         setReportUsage: vi.fn(),
         setShowCost: vi.fn(),
         setShowModel: vi.fn(),
+        setWidgetStatusTemplate: vi.fn(),
         setSubagentInstructionsFile: vi.fn(),
       };
     });
@@ -621,6 +644,15 @@ describe("settings persistence", () => {
 
       applySettings({ showModel: false }, appliers);
       expect(appliers.setShowModel).toHaveBeenCalledWith(false);
+    });
+
+    it("applies widgetStatusTemplate, including the empty-string clear", () => {
+      applySettings({ widgetStatusTemplate: "${time}" }, appliers);
+      expect(appliers.setWidgetStatusTemplate).toHaveBeenCalledWith("${time}");
+      applySettings({ widgetStatusTemplate: "" }, appliers);
+      expect(appliers.setWidgetStatusTemplate).toHaveBeenCalledWith("");
+      applySettings({}, appliers);
+      expect(appliers.setWidgetStatusTemplate).toHaveBeenCalledTimes(2); // absence is "use default"
     });
 
     it("is a no-op on an empty settings object", () => {
@@ -849,6 +881,7 @@ describe("settings persistence", () => {
         setReportUsage: vi.fn(),
         setShowCost: vi.fn(),
         setShowModel: vi.fn(),
+        setWidgetStatusTemplate: vi.fn(),
         setSubagentInstructionsFile: vi.fn(),
       };
     });

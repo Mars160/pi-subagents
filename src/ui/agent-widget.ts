@@ -12,6 +12,7 @@ import { getConfig } from "../agent-types.js";
 import type { GenerationStats } from "../generation.js";
 import type { AgentInvocation, SubagentType, WidgetMode } from "../types.js";
 import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent, type LifetimeUsage, type SessionLike } from "../usage.js";
+import { hasStatusTemplate, renderWidgetStatusTemplate, type WidgetStatusVars } from "./status-template.js";
 
 // ---- Constants ----
 
@@ -139,13 +140,28 @@ export function formatCost(cost: number): string {
  * `0.0 tok/s` would report a measurement that was never taken.
  */
 export function formatGenerationTps(generation: GenerationStats | undefined): string {
-  if (!generation) return "";
+  const tps = generationTps(generation);
+  return tps === undefined ? "" : `${tps.toFixed(1)} tok/s`;
+}
+
+/**
+ * The bare rate for `${tps}` — `42.1`, no unit — because the template decides
+ * its own punctuation. Empty when there is no valid measurement, same as
+ * `formatGenerationTps`.
+ */
+export function formatGenerationTpsValue(generation: GenerationStats | undefined): string {
+  const tps = generationTps(generation);
+  return tps === undefined ? "" : tps.toFixed(1);
+}
+
+/** Shared validity gate: the numeric rate, or undefined when none was measured. */
+function generationTps(generation: GenerationStats | undefined): number | undefined {
+  if (!generation) return undefined;
   const { outputTokens, durationMs } = generation;
-  if (!Number.isFinite(outputTokens) || !Number.isFinite(durationMs)) return "";
-  if (outputTokens <= 0 || durationMs <= 0) return "";
+  if (!Number.isFinite(outputTokens) || !Number.isFinite(durationMs)) return undefined;
+  if (outputTokens <= 0 || durationMs <= 0) return undefined;
   const tps = (outputTokens * 1000) / durationMs;
-  if (!Number.isFinite(tps)) return "";
-  return `${tps.toFixed(1)} tok/s`;
+  return Number.isFinite(tps) ? tps : undefined;
 }
 
 /**
@@ -309,6 +325,12 @@ export class AgentWidget {
      * conversation viewer unconditionally.
      */
     private showModel: () => boolean = () => false,
+    /**
+     * Read live at render time, like `mode`. The user's `widgetStatusTemplate`:
+     * when set and non-blank it replaces the `description · stats` body of every
+     * running and finished row. Undefined (the default) keeps the built-in body.
+     */
+    private statusTemplate: () => string | undefined = () => undefined,
   ) {}
 
   /**
@@ -388,6 +410,18 @@ export class AgentWidget {
     this.finishedTurnAge.delete(agentId);
   }
 
+  /**
+   * The row's `description · stats` body: the user's `widgetStatusTemplate`,
+   * styled as one dim run, or `fallback` when none is configured. Only the body
+   * is templated — the icon/name/mode prefix and any status suffix around it are
+   * assembled by the caller and never subject to the template.
+   */
+  private statusBody(theme: Theme, vars: WidgetStatusVars, fallback: string): string {
+    const template = this.statusTemplate();
+    if (!hasStatusTemplate(template)) return fallback;
+    return theme.fg("dim", renderWidgetStatusTemplate(template, vars));
+  }
+
   /** Render a finished agent line. */
   private renderFinishedLine(a: { id: string; type: SubagentType; status: string; description: string; toolUses: number; startedAt: number; completedAt?: number; error?: string; lifetimeUsage?: LifetimeUsage; invocation?: AgentInvocation; generation?: GenerationStats }, theme: Theme): string {
     const modeLabel = getPromptModeLabel(a.type);
@@ -418,7 +452,7 @@ export class AgentWidget {
     // Shown on a settled row too, and not gated by `showModel`: the level
     // describes the run, while the model name stays opt-in. From
     // buildInvocationTags so a level the spawn did not honor keeps "(asked X)".
-    const { tags } = buildInvocationTags(a.invocation);
+    const { modelName, modelId, tags } = buildInvocationTags(a.invocation);
     const thinkingTag = tags.find(tag => tag.startsWith("thinking: "));
     if (thinkingTag) parts.push(thinkingTag);
     const activity = this.agentActivity.get(a.id);
@@ -434,7 +468,27 @@ export class AgentWidget {
     parts.push(duration);
 
     const modeTag = modeLabel ? ` ${theme.fg("dim", `(${modeLabel})`)}` : "";
-    return `${icon} ${renderAgentName(a.type, theme, { fallbackColor: "dim" })}${modeTag}  ${theme.fg("dim", a.description)} ${theme.fg("dim", "·")} ${theme.fg("dim", parts.join(" · "))}${statusText}`;
+    const fallback = `${theme.fg("dim", a.description)} ${theme.fg("dim", "·")} ${theme.fg("dim", parts.join(" · "))}`;
+    // A finished record carries no turn count of its own; `${round}` reads the
+    // live tracker and is empty once that entry is gone — never fabricated.
+    const body = this.statusBody(
+      theme,
+      {
+        task_title: a.description,
+        model: modelName ?? "",
+        model_id: modelId ?? "",
+        effort: thinkingTag ? thinkingTag.slice("thinking: ".length) : "",
+        round: activity ? formatTurns(activity.turnCount, activity.maxTurns) : "",
+        tool_uses_count: String(a.toolUses),
+        total_token: formatTokens(getLifetimeTotal(a.lifetimeUsage)),
+        tps: formatGenerationTpsValue(a.generation),
+        time: duration,
+        cost: formatCost(getLifetimeCost(a.lifetimeUsage)),
+        status: a.status,
+      },
+      fallback,
+    );
+    return `${icon} ${renderAgentName(a.type, theme, { fallbackColor: "dim" })}${modeTag}  ${body}${statusText}`;
   }
 
   /**
@@ -490,7 +544,7 @@ export class AgentWidget {
       const parts: string[] = [];
       // The model is opt-in (`showModel`); the thinking level is not. Reuse
       // buildInvocationTags so a clamped level keeps its "(asked X)" note.
-      const { modelName, tags } = buildInvocationTags(a.invocation);
+      const { modelName, modelId, tags } = buildInvocationTags(a.invocation);
       if (this.showModel() && modelName) parts.push(modelName);
       const thinkingTag = tags.find(tag => tag.startsWith("thinking: "));
       if (thinkingTag) parts.push(thinkingTag);
@@ -505,8 +559,30 @@ export class AgentWidget {
 
       const activity = bg ? describeActivity(bg.activeTools, bg.responseText) : "thinking…";
 
+      const fallback = `${theme.fg("muted", a.description)} ${theme.fg("dim", "·")} ${fgPreservingNestedStyles(theme, "dim", statsText)}`;
+      // `model`/`cost` in the template are intentionally not gated by
+      // `showModel`/`showCost`: naming the placeholder is the opt-in, and
+      // `total_token` reads the raw count so 0 still renders as "0 token".
+      const body = this.statusBody(
+        theme,
+        {
+          task_title: a.description,
+          model: modelName ?? "",
+          model_id: modelId ?? "",
+          effort: thinkingTag ? thinkingTag.slice("thinking: ".length) : "",
+          round: bg ? formatTurns(bg.turnCount, bg.maxTurns) : "",
+          tool_uses_count: String(toolUses),
+          total_token: formatTokens(tokens),
+          tps: formatGenerationTpsValue(a.generation),
+          time: elapsed,
+          cost: formatCost(getLifetimeCost(a.lifetimeUsage)),
+          status: a.status,
+        },
+        fallback,
+      );
+
       runningLines.push([
-        truncate(theme.fg("dim", "├─") + ` ${theme.fg("accent", frame)} ${renderAgentName(a.type, theme, { bold: true })}${modeTag}  ${theme.fg("muted", a.description)} ${theme.fg("dim", "·")} ${fgPreservingNestedStyles(theme, "dim", statsText)}`),
+        truncate(theme.fg("dim", "├─") + ` ${theme.fg("accent", frame)} ${renderAgentName(a.type, theme, { bold: true })}${modeTag}  ${body}`),
         truncate(theme.fg("dim", "│  ") + theme.fg("dim", `  ⎿  ${activity}`)),
       ]);
     }
