@@ -96,6 +96,24 @@ export function ctx(overrides: Record<string, unknown> = {}) {
 /** Text of a tool result. */
 export const textOf = (r: any): string => r.content[0].text;
 
+/**
+ * Point pi's agent dir at a fresh temp dir for one test, so the developer's
+ * real `~/.pi/agent/subagents.json` (and every setting in it) cannot reach an
+ * extension booted inside the test. Settings are read at boot, so call this in
+ * a `beforeEach` that runs before `subagentsExtension(pi)`. Returns the
+ * restore function for `afterEach`.
+ */
+export function isolateAgentDir(): () => void {
+  const dir = mkdtempSync(join(tmpdir(), "pi-boot-agentdir-"));
+  const prev = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = dir;
+  return () => {
+    if (prev == null) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = prev;
+    rmSync(dir, { recursive: true, force: true });
+  };
+}
+
 /** Let queued microtasks run — enough for the manager's internal chaining. */
 export const flush = async () => {
   await new Promise((r) => setImmediate(r));

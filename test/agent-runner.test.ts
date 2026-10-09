@@ -140,6 +140,7 @@ import {
   setRememberAgents,
   setSubagentInstructionsFile,
 } from "../src/agent-runner.js";
+import { setDefaultModel, setForceDefaultModel } from "../src/model-policy.js";
 import { buildAgentPrompt } from "../src/prompts.js";
 import { compileJsonSchema } from "../src/workflow/json-schema.js";
 
@@ -179,9 +180,17 @@ function createSession(finalText: string) {
     }),
     // pi's Agent; `beforeToolCall` is an optional, assignable hook the scope
     // installer wraps to block out-of-scope calls on turn 1.
-    agent: { beforeToolCall: undefined } as {
+    agent: {
+      beforeToolCall: undefined,
+      // Active model as pi exposes it; the forced-default-on-resume path writes
+      // to it (AgentSession.setModel would also overwrite the user's global
+      // default in pi's settings, so it is deliberately not used).
+      state: { model: undefined as any },
+    } as {
       beforeToolCall?: (context: any, signal?: any) => Promise<any>;
+      state: { model: any };
     },
+    sessionManager: { appendModelChange: vi.fn() },
     setSessionName: vi.fn(),
     bindExtensions: vi.fn(async () => {}),
   };
@@ -2735,6 +2744,88 @@ describe("resolveDefaultModel", () => {
 
   it("returns undefined when neither a config model nor a parent model exists", () => {
     expect(resolveDefaultModel(undefined, registry([haiku]), undefined)).toBeUndefined();
+  });
+});
+
+// The runner is the last layer every spawn passes through, including the
+// programmatic ones (the manager registry, `@handle`, the scheduler) that never
+// hit a tool boundary. defaultModel and forceDefaultModel are applied here so
+// none of them can miss them.
+describe("runAgent — defaultModel / forceDefaultModel", () => {
+  const haiku = { provider: "anthropic", id: "claude-haiku-4-5", name: "Haiku 4.5" };
+  const opus = { provider: "anthropic", id: "claude-opus-4-6", name: "Opus 4.6" };
+  const modelCtx = {
+    ...ctx,
+    modelRegistry: {
+      find: (provider: string, id: string) => [haiku, opus].find(m => m.provider === provider && m.id === id),
+      getAvailable: () => [haiku, opus],
+      getAll: () => [haiku, opus],
+    },
+  } as any;
+
+  /** The model the session was created with — the one the run actually uses. */
+  const sessionModel = () => createAgentSession.mock.calls.at(-1)?.[0]?.model;
+
+  afterEach(() => {
+    setDefaultModel(undefined);
+    setForceDefaultModel(false);
+  });
+
+  it("passes the configured default model to the session when no option names one", async () => {
+    setDefaultModel("anthropic/claude-haiku-4-5");
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(modelCtx, "Explore", "go", { pi });
+
+    expect(sessionModel()).toBe(haiku);
+  });
+
+  it("lets an explicit option outrank the configured default", async () => {
+    setDefaultModel("anthropic/claude-haiku-4-5");
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(modelCtx, "Explore", "go", { pi, model: opus });
+
+    expect(sessionModel()).toBe(opus);
+  });
+
+  it("forces the default over an explicit option", async () => {
+    setDefaultModel("anthropic/claude-haiku-4-5");
+    setForceDefaultModel(true);
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(modelCtx, "Explore", "go", { pi, model: opus });
+
+    expect(sessionModel()).toBe(haiku);
+  });
+
+  it("fails the run under force with no default configured", async () => {
+    setForceDefaultModel(true);
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await expect(runAgent(modelCtx, "Explore", "go", { pi }))
+      .rejects.toThrow(/forceDefaultModel is enabled but defaultModel is not set/);
+    expect(createAgentSession).not.toHaveBeenCalled();
+  });
+
+  it("applies the forced default to a persisted session reopened in a new run", async () => {
+    // createAgentSession gives a session file's recorded model precedence over
+    // the `model` option, so a reopened conversation is re-asserted onto the
+    // forced model — otherwise `@handle` would be one route around the setting.
+    setDefaultModel("anthropic/claude-haiku-4-5");
+    setForceDefaultModel(true);
+    const { session } = createSession("OK");
+    session.agent.state.model = opus;
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(modelCtx, "Explore", "go", { pi, resumeSessionFile: "/sessions/old.jsonl" });
+
+    expect(session.agent.state.model).toBe(haiku);
+    expect(session.sessionManager.appendModelChange).toHaveBeenCalledWith("anthropic", "claude-haiku-4-5");
   });
 });
 

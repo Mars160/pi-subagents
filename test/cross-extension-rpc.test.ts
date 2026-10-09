@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type EventBus, PROTOCOL_VERSION, type RpcDeps, registerRpcHandlers, type SpawnCapable } from "../src/cross-extension-rpc.js";
+import { setDefaultModel, setForceDefaultModel } from "../src/model-policy.js";
 import { isScopeModelsEnabled, setScopeModelsEnabled } from "../src/model-scope.js";
 
 /** Simple in-process event bus for testing. */
@@ -457,6 +458,84 @@ describe("cross-extension RPC", () => {
       expect(manager.spawn).not.toHaveBeenCalled();
     });
   });
+  // --- defaultModel / forceDefaultModel on the RPC spawn path ---
+
+  describe("spawn RPC defaultModel / forceDefaultModel", () => {
+    const DEFAULT = { id: "claude-haiku-4-5", provider: "anthropic", name: "Haiku 4.5" };
+    const OTHER = { id: "claude-opus-4-6", provider: "anthropic", name: "Opus 4.6" };
+    const registry = {
+      find: (provider: string, id: string) => [DEFAULT, OTHER].find(m => m.provider === provider && m.id === id) ?? null,
+      getAll: () => [DEFAULT, OTHER],
+      getAvailable: () => [DEFAULT, OTHER],
+    };
+
+    beforeEach(() => {
+      ctx = { session: true, cwd: "/tmp", modelRegistry: registry };
+      deps = { events, pi: { events }, getCtx: () => ctx, manager };
+      setDefaultModel("anthropic/claude-haiku-4-5");
+    });
+
+    afterEach(() => {
+      setDefaultModel(undefined);
+      setForceDefaultModel(false);
+    });
+
+    async function spawn(requestId: string, options?: unknown) {
+      registerRpcHandlers(deps);
+      const reply = vi.fn();
+      events.on(`subagents:rpc:spawn:reply:${requestId}`, reply);
+      events.emit("subagents:rpc:spawn", { requestId, type: "general-purpose", prompt: "x", options });
+      await vi.waitFor(() => expect(reply).toHaveBeenCalled());
+      return (reply as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    }
+
+    const spawnedOptions = () => (manager.spawn as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[4];
+
+    it("fills in the configured default when the caller sent no model", async () => {
+      const call = await spawn("req-dm-1", {});
+
+      expect(call).toEqual({ success: true, data: { id: "agent-42" } });
+      expect(spawnedOptions()).toMatchObject({ model: DEFAULT });
+    });
+
+    it("still lets the RPC payload's model outrank the default one", async () => {
+      const call = await spawn("req-dm-2", { model: "opus" });
+
+      expect(call.success).toBe(true);
+      expect(spawnedOptions()).toMatchObject({ model: OTHER });
+    });
+
+    it("forces the default over the payload's model without resolving the ignored one", async () => {
+      setForceDefaultModel(true);
+
+      const call = await spawn("req-dm-3", { model: "no-such-model" });
+
+      expect(call.success).toBe(true);
+      expect(spawnedOptions()).toMatchObject({ model: DEFAULT });
+    });
+
+    it("refuses the spawn under force with no default configured", async () => {
+      setDefaultModel(undefined);
+      setForceDefaultModel(true);
+
+      const call = await spawn("req-dm-4", { model: "opus" });
+
+      expect(call.success).toBe(false);
+      expect(call.error).toContain("forceDefaultModel is enabled but defaultModel is not set");
+      expect(manager.spawn).not.toHaveBeenCalled();
+    });
+
+    it("refuses the spawn when the configured default cannot be resolved", async () => {
+      setDefaultModel("gpt-9");
+
+      const call = await spawn("req-dm-5", {});
+
+      expect(call.success).toBe(false);
+      expect(call.error).toContain('Configured defaultModel "gpt-9"');
+      expect(manager.spawn).not.toHaveBeenCalled();
+    });
+  });
+
   // --- scopeModels on the RPC spawn path (#240): an override on the RPC
   //     payload is an orchestrator-level choice, so it gets the Agent tool's
   //     hard error rather than reaching the spawn on an out-of-scope model. ---

@@ -24,6 +24,13 @@ import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
 import { type GenerationStats, subscribeGeneration } from "./generation.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
+import {
+  getDefaultModel,
+  isForceDefaultModel,
+  modelRegistryFromRuntime,
+  resolveEffectiveModel,
+  resolveForcedModel,
+} from "./model-policy.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
@@ -857,10 +864,22 @@ export async function runAgent(
     }
   }
 
-  // Resolve model: explicit option > config.model > parent model
-  const model = options.model ?? resolveDefaultModel(
-    ctx.model, ctx.modelRegistry, agentConfig?.model,
-  );
+  // Resolve model: forceDefaultModel > explicit option > config.model > the
+  // configured defaultModel > parent model. The configured default is applied
+  // here as well as at every tool/RPC boundary because programmatic spawns
+  // (@handle, the manager registry, the scheduler) come straight here.
+  const forcedModel = isForceDefaultModel();
+  let model = forcedModel ? undefined : options.model;
+  if (!forcedModel && model === undefined) {
+    // Exact provider/modelId match, no fuzzy, no parent fallback — unchanged.
+    model = resolveDefaultModel(undefined, ctx.modelRegistry, agentConfig?.model);
+  }
+  if (model === undefined && (forcedModel || getDefaultModel() !== undefined)) {
+    const decision = resolveEffectiveModel({ registry: ctx.modelRegistry });
+    if (decision.error) throw new Error(decision.error);
+    model = decision.model;
+  }
+  model ??= ctx.model;
 
   // Resolve thinking level: explicit option > agent config > undefined (inherit)
   const thinkingLevel = options.thinkingLevel ?? agentConfig?.thinking;
@@ -1036,6 +1055,19 @@ export async function runAgent(
 
   const { session } = await runInChildSessionContext(() => createAgentSession(sessionOpts));
 
+  // A reopened session carries the model recorded in its own file, and
+  // createAgentSession gives that precedence over the `model` option — so
+  // `forceDefaultModel` has to be re-asserted here or a persisted conversation
+  // reopened by `@handle` in a new session would be the one route around it.
+  // AgentSession.setModel cannot be used: it also writes the model into the
+  // user's pi settings as the new global default. Setting this child's own
+  // active model (and recording the change in its own session file) has no such
+  // side effect. Guarded on `agent` so a stubbed session in tests is untouched.
+  if (forcedModel && options.resumeSessionFile && model && session.agent?.state) {
+    session.agent.state.model = model;
+    session.sessionManager?.appendModelChange?.(model.provider, model.id);
+  }
+
   const baseSessionName = agentConfig?.name ?? type;
   session.setSessionName(
     options.agentId ? `${baseSessionName}#${options.agentId.slice(0, 8)}` : baseSessionName,
@@ -1193,6 +1225,19 @@ export async function resumeAgent(
     signal?: AbortSignal;
   } = {},
 ): Promise<{ text: string; failure?: string }> {
+  // A resume re-prompts a session that already exists, so nothing re-resolved
+  // its model — `forceDefaultModel` would otherwise apply only to agents started
+  // after it was turned on. Switch this child's own active model and record the
+  // change in its session file; `AgentSession.setModel` is deliberately not
+  // used because it also persists a new global default into the user's pi
+  // settings. A configured default that cannot be resolved fails the resume
+  // rather than continuing on the old model.
+  const forced = resolveForcedModel(modelRegistryFromRuntime(session.modelRuntime));
+  if (typeof forced === "string") throw new Error(forced);
+  if (forced) {
+    session.agent.state.model = forced;
+    session.sessionManager?.appendModelChange?.(forced.provider, forced.id);
+  }
   // Boundary for the history fallback: the session already holds prior turns,
   // so only assistant text produced by THIS resume prompt counts as its output
   // — a failed resume must not surface the previous turn's answer (#144).

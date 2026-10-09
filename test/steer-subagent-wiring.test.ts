@@ -13,7 +13,7 @@
  * tested: they are single-line guards whose failure is immediately visible in
  * the tool's own reply.
  */
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -22,7 +22,7 @@ vi.mock("../src/agent-runner.js", async () => {
 
 import { runAgent, steerAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
-import { ctx, flush, makePi, textOf } from "./helpers/boot-extension.js";
+import { ctx, flush, isolateAgentDir, makePi, textOf } from "./helpers/boot-extension.js";
 
 // steerAgent and runAgent are module-level mocks shared by every case here, so
 // call history has to be reset or a "was never called" assertion depends on the
@@ -73,6 +73,18 @@ async function spawnBackground(tools: Map<string, any>): Promise<string> {
 
 const steer = (tools: Map<string, any>, agent_id: string, message: string) =>
   tools.get("steer_subagent").execute("tc-steer", { agent_id, message }, undefined, undefined, ctx());
+
+
+// Boot this file's extension against an empty agent dir: settings are read at
+// boot, and the developer's real ~/.pi/agent/subagents.json must not decide what
+// these wiring tests observe.
+let restoreAgentDir: () => void;
+beforeEach(() => {
+  restoreAgentDir = isolateAgentDir();
+});
+afterEach(() => {
+  restoreAgentDir();
+});
 
 describe("steer_subagent before the session exists", () => {
   it("queues the message on the record and says so", async () => {

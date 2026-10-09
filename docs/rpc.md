@@ -16,7 +16,7 @@ For the channel list, the reply envelope, the per-channel snippets and the event
 |---|---|---|
 | `description` | string | What the agent is doing. Shown in the widget, FleetView and the completion notification |
 | `name` | string | A memorable second handle (`@auth-audit`). Slugged, never validated — anything unusable degrades rather than failing the spawn |
-| `model` | `Model` **or** `"provider/modelId"` | Strings are resolved at the RPC boundary against `ctx.modelRegistry`. `null` means inherit, not override. Resolution is fuzzy — see [Model Scope](../README.md#model-scope) |
+| `model` | `Model` **or** `"provider/modelId"` | Strings are resolved at the RPC boundary against `ctx.modelRegistry`. `null` means inherit, not override. Resolution is fuzzy — see [Model Scope](../README.md#model-scope). A configured `defaultModel` fills in when the payload sends none, and `forceDefaultModel` replaces whatever it sent (see below) |
 | `maxTurns` | number | Turn ceiling for the run |
 | `isolated` | boolean | Strips extensions, skills and nested tools. **Not** a git worktree — see the trap table below |
 | `inheritContext` | boolean | Fork the parent conversation into the child |
@@ -51,6 +51,7 @@ Four things that are not obvious from the tables:
 - **`bypassQueue` is not stripped.** Its own doc comment scopes it to the scheduler and the `/agents` generator, but a bus caller can set it and skip the `maxConcurrent` check.
 - **`structuredOutput` is documented "set only by the workflow host"** (`src/agent-manager.ts:231-234`) and is also not stripped.
 - **`signal` and the `on*` callbacks are function values.** They work only because the bus is in-process. A caller that genuinely serializes its payload cannot use them, and they arrive as `undefined` rather than failing.
+- **The project's model configuration can overrule the payload.** With `defaultModel` set, a payload that sends no model runs on it instead of inheriting; with `forceDefaultModel` on, the configured model replaces the payload's — and the ignored model is never resolved, so an unresolvable one still succeeds. Both are user config, so under [Model Scope](../README.md#model-scope) they warn rather than hard-error, while a caller-supplied model keeps its hard error. See [Default model](../README.md#persistent-settings).
 
 ### Names that look right and are not
 
@@ -69,12 +70,15 @@ One of these already shipped as a bug in this project's own README example, so i
 
 ## Errors
 
-Every failure reaches the caller as `{ success: false, error }`, where `error` is `err?.message ?? String(err)` (`src/cross-extension-rpc.ts:87`) — so these strings are what you will actually see.
+Every failure reaches the caller as `{ success: false, error }`, where `error` is `err?.message ?? String(err)` (`src/cross-extension-rpc.ts:89`) — so these strings are what you will actually see.
 
 | Error | Source |
 |---|---|
-| `No active session` | `src/cross-extension-rpc.ts:107` — called before the first bound `session_start`, or in a session that excludes pi-subagents |
-| `Model override "<label>" provided but ctx.modelRegistry is unavailable` | `src/cross-extension-rpc.ts:126` |
+| `No active session` | `src/cross-extension-rpc.ts:109` — called before the first bound `session_start`, or in a session that excludes pi-subagents |
+| `Model override "<label>" provided but ctx.modelRegistry is unavailable` | `src/cross-extension-rpc.ts:129` |
+| `defaultModel is configured but ctx.modelRegistry is unavailable` | `src/cross-extension-rpc.ts:166` — the user's configured default (or `forceDefaultModel`) had to be resolved and no registry was available |
+| `forceDefaultModel is enabled but defaultModel is not set — …` | `src/model-policy.ts:92` — the project forces a default but has not configured one |
+| `Configured defaultModel "<input>" [required by forceDefaultModel] could not be resolved.` + available models | `src/model-policy.ts:96` — a configured default that cannot be resolved fails the spawn rather than inheriting the parent |
 | `Model not found: "<input>".` + available models | `src/model-resolver.ts:117` |
 | `Model not in scope: "<input>".` + allowed models | `src/model-scope.ts:62` — only with `scopeModels` on, and checked against the *resolved* model |
 | `Unknown or disabled agent type: "<raw>". Available: <list>.` | `src/agent-types.ts:187` — only under `fallbackSubagent: none` |
@@ -85,10 +89,10 @@ Every failure reaches the caller as `{ success: false, error }`, where `error` i
 | `SpawnOptions.cwd is not a directory: "<cwd>"` | `src/agent-manager.ts:94` |
 | `Cannot run with isolation: "worktree" — not a git repo, no commits yet, or 'git worktree add' failed.` | `src/agent-manager.ts:716-719`, surfaced through `awaitStartup` |
 | git plumbing failures | `src/worktree.ts:76` |
-| `Agent not found` | stop — `src/cross-extension-rpc.ts:170` |
-| `Agent is owned by another agent or workflow` | stop — `:178` |
-| `Agent is not running` | stop — `:182`. The record exists, so it has already settled |
-| `Agent not found or still running` | consume — `:193` |
+| `Agent not found` | stop — `src/cross-extension-rpc.ts:198` |
+| `Agent is owned by another agent or workflow` | stop — `:206` |
+| `Agent is not running` | stop — `:210`. The record exists, so it has already settled |
+| `Agent not found or still running` | consume — `:221` |
 
 Three things the table cannot show:
 

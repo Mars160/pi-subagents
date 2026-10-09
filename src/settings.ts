@@ -67,6 +67,38 @@ export interface SubagentsSettings {
    */
   schedulingEnabled?: boolean;
   /**
+   * Project/global default model for subagents that don't name one, as
+   * `"provider/modelId"` or one of the fuzzy spellings the `Agent` tool's
+   * `model:` param accepts (e.g. `"haiku"`).
+   *
+   * It is a *fallback*, not an override: a caller's `model:` and an agent
+   * file's `model:` frontmatter both still win, and it sits above the inherited
+   * parent model. `forceDefaultModel` is what makes it outrank them. A model
+   * that cannot be resolved fails the spawn rather than silently inheriting the
+   * parent — the setting was configured to run these agents a particular way.
+   *
+   * `""` is a real value: a project file clearing a globally configured
+   * default. Absent means "no default here", so the global one still applies
+   * after the merge.
+   */
+  defaultModel?: string;
+  /**
+   * When true, `defaultModel` outranks every other model choice — the caller's
+   * `Agent({ model })`, an agent file's frontmatter, a workflow script's
+   * `model:`, and the RPC payload — so a project can pin subagent spend to one
+   * model. Defaults to false.
+   *
+   * Requires `defaultModel`: with the setting on and no model configured every
+   * spawn fails with a configuration error instead of quietly falling back. A
+   * configured model that cannot be resolved fails the same way.
+   *
+   * Resumes are covered too — a live session is switched onto the default
+   * before its next turn, and a persisted conversation reopened in a new pi
+   * session has it applied after the session file's own recorded model — so
+   * there is no `resume` route around the setting.
+   */
+  forceDefaultModel?: boolean;
+  /**
    * When true, the effective model of each subagent spawn is validated
    * against `enabledModels` from pi's settings — both global
    * (`<agentDir>/settings.json`) and project-local (`<cwd>/.pi/settings.json`),
@@ -353,6 +385,8 @@ export interface SettingsAppliers {
   setMaxSubagentDepth: (n: number) => void;
   setFallbackSubagent: (v: string | undefined) => void;
   setSubagentInstructionsFile: (v: string | undefined) => void;
+  setDefaultModel: (v: string | undefined) => void;
+  setForceDefaultModel: (b: boolean) => void;
   setReportUsage: (b: boolean) => void;
   setShowCost: (b: boolean) => void;
   setShowModel: (b: boolean) => void;
@@ -497,6 +531,13 @@ function sanitize(raw: unknown): SubagentsSettings {
     // Keep empty strings so a project can disable the global file.
     out.subagentInstructionsFile = r.subagentInstructionsFile.trim();
   }
+  if (typeof r.defaultModel === "string") {
+    // Keep empty strings so a project can clear a globally configured model.
+    out.defaultModel = r.defaultModel.trim();
+  }
+  if (typeof r.forceDefaultModel === "boolean") {
+    out.forceDefaultModel = r.forceDefaultModel;
+  }
   return out;
 }
 
@@ -558,6 +599,8 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.subagentInstructionsFile === "string") {
     appliers.setSubagentInstructionsFile(s.subagentInstructionsFile);
   }
+  if (typeof s.defaultModel === "string") appliers.setDefaultModel(s.defaultModel);
+  if (typeof s.forceDefaultModel === "boolean") appliers.setForceDefaultModel(s.forceDefaultModel);
   if (s.defaultJoinMode) appliers.setDefaultJoinMode(s.defaultJoinMode);
   if (typeof s.backgroundByDefault === "boolean") appliers.setBackgroundByDefault(s.backgroundByDefault);
   if (typeof s.schedulingEnabled === "boolean") appliers.setSchedulingEnabled(s.schedulingEnabled);

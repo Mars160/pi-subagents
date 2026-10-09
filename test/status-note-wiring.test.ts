@@ -4,7 +4,7 @@
  * a string. Drives the registered `Agent` / `get_subagent_result` tools and
  * inspects the text delivered back, for a turn-limit abort and a user stop.
  */
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/agent-runner.js", async () => {
   const actual = await vi.importActual<typeof import("../src/agent-runner.js")>("../src/agent-runner.js");
@@ -13,6 +13,19 @@ vi.mock("../src/agent-runner.js", async () => {
 
 import { runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
+import { isolateAgentDir } from "./helpers/boot-extension.js";
+
+
+// Boot this file's extension against an empty agent dir: settings are read at
+// boot, and the developer's real ~/.pi/agent/subagents.json must not decide what
+// these wiring tests observe.
+let restoreAgentDir: () => void;
+beforeEach(() => {
+  restoreAgentDir = isolateAgentDir();
+});
+afterEach(() => {
+  restoreAgentDir();
+});
 
 function makePi() {
   const tools = new Map<string, any>();

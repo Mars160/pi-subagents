@@ -36,7 +36,7 @@ import { existsSync } from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentManager } from "../agent-manager.js";
 import { getAgentConfig, resolveSpawnType } from "../agent-types.js";
-import { resolveModel } from "../model-resolver.js";
+import { resolveEffectiveModel } from "../model-policy.js";
 import { checkModelScope } from "../model-scope.js";
 import type { AgentRecord, ThinkingLevel } from "../types.js";
 import { getLifetimeTotal } from "../usage.js";
@@ -197,21 +197,20 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       const dispatch = resolveSpawnType(request.agentType);
       if (!dispatch.ok) return { ok: false, error: dispatch.message };
 
-      // Same precedence as the Agent tool: the caller's model wins, the agent
-      // definition's is next, and the parent's is the floor. A model the script
-      // named and we cannot resolve is an error; one the definition named falls
-      // back to the parent silently, because the script never asked for it.
-      let model = ctx.model;
+      // Same precedence as the Agent tool, plus the shared model policy: a
+      // forced default outranks everything, a configured `defaultModel` fills
+      // in when neither the script nor the agent definition named a model, and
+      // an unresolvable model the script named is this agent's error.
       const config = getAgentConfig(dispatch.type);
-      const modelInput = request.model ?? config?.model;
-      if (modelInput !== undefined) {
-        const resolved = resolveModel(modelInput, ctx.modelRegistry);
-        if (typeof resolved === "string") {
-          if (request.model !== undefined) return { ok: false, error: resolved };
-        } else {
-          model = resolved;
-        }
-      }
+      const modelSelection = resolveEffectiveModel({
+        candidate: request.model !== undefined
+          ? { input: request.model, source: "params" }
+          : { input: config?.model, source: "frontmatter" },
+        registry: ctx.modelRegistry,
+      });
+      if (modelSelection.error && modelSelection.fatal) return { ok: false, error: modelSelection.error };
+      const model = modelSelection.model ?? ctx.model;
+      const modelInput = modelSelection.input;
 
       // Same scopeModels policy as the Agent tool and the nested delegation
       // tools: a script's `agent({ model })` is a runtime LLM choice, and the
@@ -224,7 +223,7 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
         model,
         cwd: ctx.cwd,
         modelRegistry: ctx.modelRegistry,
-        callerSupplied: request.model !== undefined,
+        callerSupplied: modelSelection.callerSupplied,
         agentLabel: config?.displayName ?? dispatch.type,
         modelInput,
       });

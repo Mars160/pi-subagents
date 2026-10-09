@@ -258,6 +258,39 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({ widgetStatusTemplate: "  ${task_title}  " });
   });
 
+  it("round-trips forceDefaultModel; drops non-boolean", () => {
+    saveSettings({ forceDefaultModel: true }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ forceDefaultModel: true });
+    saveSettings({ forceDefaultModel: false }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ forceDefaultModel: false });
+    writeProject({ forceDefaultModel: "on" } as any);
+    expect(loadSettings(projectDir)).toEqual({});
+  });
+
+  it("round-trips defaultModel, including the empty-string clear", () => {
+    saveSettings({ defaultModel: "anthropic/claude-haiku-4-5" }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ defaultModel: "anthropic/claude-haiku-4-5" });
+    // "" is a real value (a project clearing a global default), not an absent
+    // field, so it has to survive the sanitizer and the write.
+    saveSettings({ defaultModel: "" }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ defaultModel: "" });
+    writeProject({ defaultModel: 42 });
+    expect(loadSettings(projectDir)).toEqual({}); // non-string dropped
+  });
+
+  it("lets a project clear a global defaultModel with an empty string", () => {
+    writeGlobal({ defaultModel: "anthropic/claude-opus-4-6" });
+    writeProject({ defaultModel: "" });
+    expect(loadSettings(projectDir)).toEqual({ defaultModel: "" });
+  });
+
+  it("trims defaultModel but keeps whitespace-only as the clear", () => {
+    writeProject({ defaultModel: "  anthropic/claude-haiku-4-5  " });
+    expect(loadSettings(projectDir)).toEqual({ defaultModel: "anthropic/claude-haiku-4-5" });
+    writeProject({ defaultModel: "   " });
+    expect(loadSettings(projectDir)).toEqual({ defaultModel: "" });
+  });
+
   it("round-trips workflowsEnabled; drops non-boolean", () => {
     saveSettings({ workflowsEnabled: true }, projectDir);
     expect(loadSettings(projectDir)).toEqual({ workflowsEnabled: true });
@@ -612,6 +645,8 @@ describe("settings persistence", () => {
         setShowModel: vi.fn(),
         setWidgetStatusTemplate: vi.fn(),
         setSubagentInstructionsFile: vi.fn(),
+        setDefaultModel: vi.fn(),
+        setForceDefaultModel: vi.fn(),
       };
     });
 
@@ -796,6 +831,26 @@ describe("settings persistence", () => {
       expect(appliers.setSubagentInstructionsFile).toHaveBeenCalledTimes(2); // absence is "use default"
     });
 
+    it("applies defaultModel, including the empty-string clear", () => {
+      applySettings({ defaultModel: "anthropic/claude-haiku-4-5" }, appliers);
+      expect(appliers.setDefaultModel).toHaveBeenCalledWith("anthropic/claude-haiku-4-5");
+      // "" must reach the applier: it is the project's way to clear a global
+      // default, and dropping it would silently re-inherit the global one.
+      applySettings({ defaultModel: "" }, appliers);
+      expect(appliers.setDefaultModel).toHaveBeenCalledWith("");
+      applySettings({}, appliers);
+      expect(appliers.setDefaultModel).toHaveBeenCalledTimes(2); // absence is "use global/none"
+    });
+
+    it("applies forceDefaultModel (both true and false)", () => {
+      applySettings({ forceDefaultModel: true }, appliers);
+      expect(appliers.setForceDefaultModel).toHaveBeenCalledWith(true);
+      applySettings({ forceDefaultModel: false }, appliers);
+      expect(appliers.setForceDefaultModel).toHaveBeenCalledWith(false);
+      applySettings({}, appliers);
+      expect(appliers.setForceDefaultModel).toHaveBeenCalledTimes(2); // absence is "use default (off)"
+    });
+
     it("applies defaultMaxTurns: 0 as the explicit unlimited marker", () => {
       applySettings({ defaultMaxTurns: 0 }, appliers);
       expect(appliers.setDefaultMaxTurns).toHaveBeenCalledWith(0);
@@ -883,6 +938,8 @@ describe("settings persistence", () => {
         setShowModel: vi.fn(),
         setWidgetStatusTemplate: vi.fn(),
         setSubagentInstructionsFile: vi.fn(),
+        setDefaultModel: vi.fn(),
+        setForceDefaultModel: vi.fn(),
       };
     });
 

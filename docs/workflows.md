@@ -239,7 +239,7 @@ Spawns one subagent and resolves to its final text — or, with `schema`, to a v
 | `label` | string | Display name in the progress tree. Also the handle `resume` addresses |
 | `phase` | string | Put this agent in a named group, overriding the ambient `phase()`. **Use it inside `pipeline`/`parallel` stages**, where the ambient phase races |
 | `agentType` | string | Which agent definition to use. Defaults to `general-purpose`; built-ins are `general-purpose`, `Explore`, `Plan`, plus your custom agents |
-| `model` | string | `provider/modelId`, or fuzzy like `haiku` |
+| `model` | string | `provider/modelId`, or fuzzy like `haiku`. Outranks the agent definition's own `model:`. A project's `defaultModel` fills in when neither names one; with `forceDefaultModel` on, the project's model wins over this option too |
 | `effort` | string | `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Omitted, the agent definition's own `thinking` decides, then the parent's |
 | `isolation` | `"worktree"` | Run in a throwaway git worktree. Only when agents write files in parallel and would collide — it costs setup time and disk per agent |
 | `gate` | string | A shell command run after the agent finishes; a non-zero exit fails the agent and its output becomes the error |
@@ -248,7 +248,7 @@ Spawns one subagent and resolves to its final text — or, with `schema`, to a v
 
 Any other key is rejected **by name** at the call. Note that this checks option *keys*, not option *values* — an `agentType` that names no known agent falls back to `general-purpose` silently.
 
-Combination rules: `resume` cannot be combined with `agentType`, `model`, `effort`, `isolation`, `gate` or `schema` — a resumed child keeps the agent type, model and tree it was started with, and its session predates the `StructuredOutput` tool.
+Combination rules: `resume` cannot be combined with `agentType`, `model`, `effort`, `isolation`, `gate` or `schema` — a resumed child keeps the agent type, model and tree it was started with, and its session predates the `StructuredOutput` tool. A project's `forceDefaultModel` is the exception: a resumed child's session is switched onto the forced default before its next turn, so a `defaultModel`/`forceDefaultModel` pair (see [Persistent settings](../README.md#persistent-settings)) is not a route around it.
 
 ### `pipeline()` and `parallel()`
 

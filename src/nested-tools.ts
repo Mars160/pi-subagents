@@ -17,7 +17,7 @@ import {
 } from "./agent-types.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { isolationParam, resolveAgentInvocationConfig } from "./invocation-config.js";
-import { resolveModel } from "./model-resolver.js";
+import { preferAgentFileModel, resolveEffectiveModel } from "./model-policy.js";
 import { checkModelScope } from "./model-scope.js";
 import {
   createOutputFilePath,
@@ -167,7 +167,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       prompt: Type.String({ description: "Self-contained task for the nested agent." }),
       description: Type.String({ description: "Short 3-5 word task description." }),
       subagent_type: Type.String({ description: `Allowed nested agent type. Available: ${availableIn(loadRegistry()).join(", ") || "none"}.` }),
-      model: Type.Optional(Type.String({ description: "Optional provider/model override." })),
+      model: Type.Optional(Type.String({ description: "Optional provider/model override. Ignored when the project forces a default model (forceDefaultModel)." })),
       thinking: Type.Optional(Type.String({ description: "Optional thinking level." })),
       max_turns: Type.Optional(Type.Number({ minimum: 1 })),
       run_in_background: Type.Optional(
@@ -228,15 +228,14 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         worktreeAllowed: isWorktreeIsolationEnabled(),
         defaultRunInBackground: false,
       });
-      let model = ctx.model;
-      if (invocation.modelInput) {
-        const resolvedModel = resolveModel(invocation.modelInput, ctx.modelRegistry);
-        if (typeof resolvedModel === "string") {
-          if (invocation.modelFromParams) return textResult(resolvedModel, true);
-        } else {
-          model = resolvedModel;
-        }
-      }
+      // Model precedence is shared with the Agent tool (model-policy.ts), so a
+      // nested spawn cannot escape `forceDefaultModel` or skip `defaultModel`.
+      const modelSelection = resolveEffectiveModel({
+        candidate: preferAgentFileModel(config?.model, params.model),
+        registry: ctx.modelRegistry,
+      });
+      if (modelSelection.error && modelSelection.fatal) return textResult(modelSelection.error, true);
+      const model = modelSelection.model ?? ctx.model;
 
       // Same scopeModels policy as the top-level Agent tool — a nested spawn
       // must not escape the allowlist. A "warn" verdict proceeds silently:
@@ -245,9 +244,9 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         model,
         cwd: context.configCwd,
         modelRegistry: ctx.modelRegistry,
-        callerSupplied: invocation.modelFromParams,
+        callerSupplied: modelSelection.callerSupplied,
         agentLabel: config?.displayName ?? resolvedType,
-        modelInput: invocation.modelInput,
+        modelInput: modelSelection.input,
       });
       if (scopeVerdict.kind === "error") return textResult(scopeVerdict.message, true);
 

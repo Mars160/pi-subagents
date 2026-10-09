@@ -20,6 +20,7 @@ vi.mock("../src/agent-runner.js", async () => {
 import { resumeAgent, runAgent } from "../src/agent-runner.js";
 import { registerAgents } from "../src/agent-types.js";
 import subagentsExtension from "../src/index.js";
+import { setDefaultModel, setForceDefaultModel } from "../src/model-policy.js";
 
 function agentTool() {
   const tools = new Map<string, any>();
@@ -118,6 +119,126 @@ afterEach(() => {
   registerAgents(new Map());
   rmSync(cwd, { recursive: true, force: true });
   vi.restoreAllMocks();
+});
+
+/** Plain text the tool returned, for the configuration-error assertions. */
+function textOf(result: any): string {
+  return (result.content ?? []).map((c: any) => c.text ?? "").join("");
+}
+
+describe("Agent tool — defaultModel / forceDefaultModel", () => {
+  const spawnedModel = () => vi.mocked(runAgent).mock.calls.at(-1)?.[3]?.model as any;
+
+  function childReports(provider: string, id: string) {
+    vi.mocked(runAgent).mockImplementation(async (_c: any, _t: any, _p: any, options: any) => {
+      const s = session(provider, id, "high");
+      options.onSessionCreated?.(s);
+      return { responseText: "done", session: s, aborted: false, steered: false } as never;
+    });
+  }
+
+  const call = (overrides: Record<string, unknown> = {}) =>
+    ({ prompt: "go", description: "d", subagent_type: "general-purpose", run_in_background: false, ...overrides });
+
+  afterEach(() => {
+    setDefaultModel(undefined);
+    setForceDefaultModel(false);
+  });
+
+  beforeEach(() => {
+    vi.mocked(runAgent).mockClear();
+  });
+
+  it("runs the configured default model when nothing names one", async () => {
+    setDefaultModel("anthropic/claude-haiku-4-5");
+    childReports("anthropic", "claude-haiku-4-5");
+    const tool = agentTool();
+
+    const result = await tool.execute("tc-dm-1", call(), undefined, vi.fn(), ctx());
+
+    expect(spawnedModel()).toMatchObject({ provider: "anthropic", id: "claude-haiku-4-5" });
+    expect(result.details.modelName).toBe("haiku 4.5");
+  });
+
+  it("still lets a caller's model outrank the default one", async () => {
+    setDefaultModel("anthropic/claude-haiku-4-5");
+    childReports("anthropic", "claude-opus-4-6");
+    const tool = agentTool();
+
+    await tool.execute("tc-dm-2", call({ model: "opus" }), undefined, vi.fn(), ctx());
+
+    // Non-forced defaultModel is a fallback, not an override.
+    expect(spawnedModel()).toMatchObject({ id: "claude-opus-4-6" });
+  });
+
+  it("still lets an agent file's frontmatter outrank the default one", async () => {
+    setDefaultModel("anthropic/claude-haiku-4-5");
+    pinnedAgent("model: anthropic/claude-opus-4-6\n");
+    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as never);
+    const tool = agentTool();
+
+    const result = await tool.execute(
+      "tc-dm-3",
+      call({ subagent_type: "pinned", run_in_background: true }),
+      undefined,
+      undefined,
+      ctx(),
+    );
+
+    expect(result.details.modelName).toBe("opus 4.6");
+  });
+
+  it("fails the spawn when the configured default cannot be resolved", async () => {
+    setDefaultModel("gpt-9");
+    const tool = agentTool();
+
+    const result = await tool.execute("tc-dm-4", call(), undefined, vi.fn(), ctx());
+
+    expect(textOf(result)).toContain('Configured defaultModel "gpt-9"');
+    expect(runAgent).not.toHaveBeenCalled();
+  });
+
+  it("forces the default over the caller's model and an agent file's frontmatter", async () => {
+    setDefaultModel("anthropic/claude-haiku-4-5");
+    setForceDefaultModel(true);
+    pinnedAgent("model: anthropic/claude-opus-4-6\n");
+    childReports("anthropic", "claude-haiku-4-5");
+    const tool = agentTool();
+
+    const result = await tool.execute(
+      "tc-dm-5",
+      call({ subagent_type: "pinned", model: "anthropic/claude-opus-4-6" }),
+      undefined,
+      vi.fn(),
+      ctx(),
+    );
+
+    expect(spawnedModel()).toMatchObject({ id: "claude-haiku-4-5" });
+    expect(result.details.modelName).toBe("haiku 4.5");
+  });
+
+  it("ignores rather than resolves a caller model the forced default overrides", async () => {
+    // A typo in a model that is about to be ignored must not fail the call.
+    setDefaultModel("anthropic/claude-haiku-4-5");
+    setForceDefaultModel(true);
+    childReports("anthropic", "claude-haiku-4-5");
+    const tool = agentTool();
+
+    const result = await tool.execute("tc-dm-6", call({ model: "no-such-model" }), undefined, vi.fn(), ctx());
+
+    expect(textOf(result)).not.toContain("Model not found");
+    expect(spawnedModel()).toMatchObject({ id: "claude-haiku-4-5" });
+  });
+
+  it("refuses to spawn under forceDefaultModel with no default configured", async () => {
+    setForceDefaultModel(true);
+    const tool = agentTool();
+
+    const result = await tool.execute("tc-dm-7", call({ model: "opus" }), undefined, vi.fn(), ctx());
+
+    expect(textOf(result)).toContain("forceDefaultModel is enabled but defaultModel is not set");
+    expect(runAgent).not.toHaveBeenCalled();
+  });
 });
 
 describe("Agent tool result — effective model", () => {

@@ -1,4 +1,5 @@
 import { Type } from "@sinclair/typebox";
+import { preferAgentFileModel } from "./model-policy.js";
 import type { AgentConfig, IsolationMode, JoinMode, ThinkingLevel } from "./types.js";
 
 /**
@@ -123,6 +124,10 @@ export function resolveAgentInvocationConfig(
   const requested = agentConfig?.isolation ?? params.isolation;
   const isolation = requested === "worktree" && opts?.worktreeAllowed !== false ? "worktree" : undefined;
 
+  // The winner of frontmatter-vs-caller, before model-policy layers the
+  // configured default and the forced override on top of it.
+  const model = preferAgentFileModel(agentConfig?.model, params.model);
+
   const overriddenThinking = agentConfig?.thinking != null && params.thinking != null
     && agentConfig.thinking !== params.thinking
     ? params.thinking as ThinkingLevel
@@ -133,8 +138,8 @@ export function resolveAgentInvocationConfig(
     : undefined;
 
   return {
-    modelInput: agentConfig?.model ?? params.model,
-    modelFromParams: agentConfig?.model == null && params.model != null,
+    modelInput: model.input,
+    modelFromParams: model.source === "params" && model.input !== undefined,
     thinking: (agentConfig?.thinking ?? params.thinking) as ThinkingLevel | undefined,
     maxTurns: agentConfig?.maxTurns ?? params.max_turns,
     inheritContext: agentConfig?.inheritContext ?? params.inherit_context ?? false,

@@ -13,7 +13,7 @@
  * feeds it: the host reading the record's snapshot and handing it over.
  */
 
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/agent-runner.js", () => ({
   runAgent: vi.fn(),
@@ -30,6 +30,7 @@ vi.mock("../src/worktree.js", () => ({
 import { AgentManager } from "../src/agent-manager.js";
 import { runAgent } from "../src/agent-runner.js";
 import { registerAgents } from "../src/agent-types.js";
+import { setDefaultModel, setForceDefaultModel } from "../src/model-policy.js";
 import { createWorkflowHost } from "../src/workflow/host.js";
 import type { WorkflowSpawnRequest } from "../src/workflow/runtime.js";
 import { ctx } from "./helpers/boot-extension.js";
@@ -212,5 +213,83 @@ describe("the workflow host reports a child's effective configuration", () => {
     expect(recordId).toBeTruthy();
     expect(recordId).not.toBe("wf-agent-0");
     expect(manager.getRecord(recordId!)).toBeDefined();
+  });
+});
+
+describe("workflow agent() honours defaultModel / forceDefaultModel", () => {
+  const haiku = { provider: "anthropic", id: "claude-haiku-4-5", name: "Haiku 4.5" };
+  const opus = { provider: "anthropic", id: "claude-opus-4-6", name: "Opus 4.6" };
+  const registry = {
+    find: (provider: string, id: string) => [haiku, opus].find(m => m.provider === provider && m.id === id),
+    getAll: () => [haiku, opus],
+    getAvailable: () => [haiku, opus],
+  };
+  let manager: AgentManager;
+
+  beforeEach(() => {
+    vi.mocked(runAgent).mockReset();
+    registerAgents(new Map());
+    manager = new AgentManager();
+  });
+
+  afterEach(() => {
+    setDefaultModel(undefined);
+    setForceDefaultModel(false);
+  });
+
+  const spawnedModel = () => vi.mocked(runAgent).mock.calls.at(-1)?.[3]?.model as any;
+
+  it("uses the configured default when neither the script nor the agent file names a model", async () => {
+    childSessionReports({ model: haiku });
+    setDefaultModel("anthropic/claude-haiku-4-5");
+    const host = createWorkflowHost({ pi, ctx: ctx({ modelRegistry: registry }), manager });
+
+    const result = await host.spawnAgent(spawnRequest());
+
+    expect(result.ok).toBe(true);
+    expect(spawnedModel()).toMatchObject({ provider: "anthropic", id: "claude-haiku-4-5" });
+  });
+
+  it("still lets the script's model outrank the configured default", async () => {
+    childSessionReports({ model: opus });
+    setDefaultModel("anthropic/claude-haiku-4-5");
+    const host = createWorkflowHost({ pi, ctx: ctx({ modelRegistry: registry }), manager });
+
+    await host.spawnAgent(spawnRequest({ model: "opus" }));
+
+    expect(spawnedModel()).toMatchObject({ id: "claude-opus-4-6" });
+  });
+
+  it("forces the default over the script's model without resolving the ignored one", async () => {
+    childSessionReports({ model: haiku });
+    setDefaultModel("anthropic/claude-haiku-4-5");
+    setForceDefaultModel(true);
+    const host = createWorkflowHost({ pi, ctx: ctx({ modelRegistry: registry }), manager });
+
+    // "no-such-model" must not fail this agent: the forced default won.
+    const result = await host.spawnAgent(spawnRequest({ model: "no-such-model" }));
+
+    expect(result.ok).toBe(true);
+    expect(spawnedModel()).toMatchObject({ id: "claude-haiku-4-5" });
+  });
+
+  it("fails this agent, not the run, under force with no default configured", async () => {
+    setForceDefaultModel(true);
+    const host = createWorkflowHost({ pi, ctx: ctx({ modelRegistry: registry }), manager });
+
+    const result = await host.spawnAgent(spawnRequest());
+
+    expect(result.ok).toBe(false);
+    expect((result as { error?: string }).error).toContain("forceDefaultModel is enabled but defaultModel is not set");
+    expect(runAgent).not.toHaveBeenCalled();
+  });
+
+  it("keeps an unresolvable script model an error when nothing is forced", async () => {
+    const host = createWorkflowHost({ pi, ctx: ctx({ modelRegistry: registry }), manager });
+
+    const result = await host.spawnAgent(spawnRequest({ model: "no-such-model" }));
+
+    expect(result.ok).toBe(false);
+    expect((result as { error?: string }).error).toContain("Model not found");
   });
 });

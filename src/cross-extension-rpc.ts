@@ -13,7 +13,10 @@
  * completion-notification race, and what protocol version 2 does not promise.
  */
 
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { isTopLevelAgent } from "./agent-manager.js";
+import { getAgentConfig, resolveSpawnType } from "./agent-types.js";
+import { getDefaultModel, isForceDefaultModel, resolveEffectiveModel } from "./model-policy.js";
 import { type ModelRegistry, resolveModel } from "./model-resolver.js";
 import { checkModelScope } from "./model-scope.js";
 import type { AgentRecord } from "./types.js";
@@ -117,7 +120,10 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
       // field as null, and the runner reads `options.model ?? default`, so null
       // means "inherit" — not an override to resolve or scope-check.
       const override = normalizedOptions.model;
-      if (override != null) {
+      const forced = isForceDefaultModel();
+      const dispatch = resolveSpawnType(type);
+      const agentModel = dispatch.ok ? getAgentConfig(dispatch.type)?.model : undefined;
+      if (override != null && !forced) {
         const { modelRegistry, cwd } = ctx as { modelRegistry?: ModelRegistry; cwd?: string };
         // Names the override the same way in both messages below; an object
         // override would otherwise interpolate as "[object Object]".
@@ -153,6 +159,33 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
           modelInput: label,
         });
         if (verdict.kind === "error") throw new Error(verdict.message);
+      } else if (forced || (getDefaultModel() && !agentModel)) {
+        // Without force, leave a frontmatter pin to the runner rather than
+        // passing the configured default as an explicit override of that pin.
+        // The user's configured default fills in when the caller sent no model,
+        // and — under `forceDefaultModel` — replaces one it did send. In the
+        // forced case the caller's model is deliberately NOT resolved: it is
+        // being ignored, so a typo in it must not fail the call.
+        const { modelRegistry, cwd } = ctx as { modelRegistry?: ModelRegistry; cwd?: string };
+        if (!modelRegistry) {
+          throw new Error("defaultModel is configured but ctx.modelRegistry is unavailable");
+        }
+        const decision = resolveEffectiveModel({ registry: modelRegistry });
+        if (decision.error) throw new Error(decision.error);
+        normalizedOptions = { ...normalizedOptions, model: decision.model };
+        // User config, not an LLM choice — `callerSupplied: false` keeps
+        // scopeModels on its warn branch (there is no error branch to hit).
+        const verdict = checkModelScope({
+          model: decision.model,
+          cwd: cwd ?? process.cwd(),
+          modelRegistry,
+          callerSupplied: false,
+          agentLabel: type,
+          modelInput: decision.input,
+        });
+        if (verdict.kind === "warn") {
+          (ctx as { ui?: ExtensionContext["ui"] }).ui?.notify(verdict.message, "warning");
+        }
       }
 
       const id = manager.spawn(pi, ctx, type, prompt, normalizedOptions);

@@ -29,6 +29,14 @@ import { GroupJoinManager } from "./group-join.js";
 import { isolationParam, resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
 import { describeMention, handleBase, isReservedHandle, parseMention, resolveHandleToType, stripAgentPrefix } from "./mention.js";
 import { runMentionClone } from "./mention-clone.js";
+import {
+  getDefaultModel,
+  isForceDefaultModel,
+  preferAgentFileModel,
+  resolveEffectiveModel,
+  setDefaultModel,
+  setForceDefaultModel,
+} from "./model-policy.js";
 import { describeModel, type ModelRegistry, resolveModel } from "./model-resolver.js";
 import { checkModelScope, isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
@@ -1434,6 +1442,8 @@ export default function (pi: ExtensionAPI) {
       setMaxSubagentDepth: setMaxSubagentDepth,
       setFallbackSubagent: setFallbackSubagent,
       setSubagentInstructionsFile,
+      setDefaultModel,
+      setForceDefaultModel,
       setReportUsage,
       setShowCost,
       setShowModel,
@@ -1621,7 +1631,7 @@ Terse command-style prompts produce shallow, generic work.
       model: Type.Optional(
         Type.String({
           description:
-            'Optional model override. Accepts "provider/modelId" or fuzzy name (e.g. "haiku", "sonnet"). Omit to use the agent type\'s default.',
+            'Optional model override. Accepts "provider/modelId" or fuzzy name (e.g. "haiku", "sonnet"). Omit to use the agent type\'s default. Ignored when the project forces a default model (forceDefaultModel).',
         }),
       ),
       thinking: Type.Optional(
@@ -1822,17 +1832,16 @@ Terse command-style prompts produce shallow, generic work.
         defaultRunInBackground: getBackgroundByDefault(),
       });
 
-      // Resolve model from agent config first; tool-call params only fill gaps.
-      let model = ctx.model;
-      if (resolvedConfig.modelInput) {
-        const resolved = resolveModel(resolvedConfig.modelInput, ctx.modelRegistry);
-        if (typeof resolved === "string") {
-          if (resolvedConfig.modelFromParams) return textResult(resolved);
-          // config-specified: silent fallback to parent
-        } else {
-          model = resolved;
-        }
-      }
+      // Model precedence lives in model-policy.ts: forceDefaultModel > the
+      // agent file vs the caller (frontmatter wins here) > defaultModel > the
+      // parent model. Resolution failures are fatal for everything except an
+      // agent file's own typo, which keeps its historical silent fall back.
+      const modelSelection = resolveEffectiveModel({
+        candidate: preferAgentFileModel(customConfig?.model, params.model),
+        registry: ctx.modelRegistry,
+      });
+      if (modelSelection.error && modelSelection.fatal) return textResult(modelSelection.error);
+      const model = modelSelection.model ?? ctx.model;
 
       // Scope validation: the effective resolved model is checked against the
       // user's enabledModels list. Policy (hard error vs warn-and-proceed) lives
@@ -1841,9 +1850,9 @@ Terse command-style prompts produce shallow, generic work.
         model,
         cwd: ctx.cwd,
         modelRegistry: ctx.modelRegistry,
-        callerSupplied: resolvedConfig.modelFromParams,
+        callerSupplied: modelSelection.callerSupplied,
         agentLabel: customConfig?.displayName ?? subagentType,
-        modelInput: resolvedConfig.modelInput,
+        modelInput: modelSelection.input,
       });
       if (scopeVerdict.kind === "error") return textResult(scopeVerdict.message);
       if (scopeVerdict.kind === "warn") ctx.ui.notify(scopeVerdict.message, "warning");
@@ -3493,6 +3502,11 @@ Write the file using the write tool. Only write the file, nothing else.`;
       // undefined is dropped by JSON.stringify, so "not configured" stays that
       // way rather than becoming an explicit empty string.
       subagentInstructionsFile: getSubagentInstructionsFile(),
+      // Raw, not normalized: "" is a real value that clears a globally
+      // configured default, while undefined (dropped by JSON.stringify) means
+      // "no default here" so the global one still applies after the merge.
+      defaultModel: getDefaultModel(),
+      forceDefaultModel: isForceDefaultModel(),
       reportUsage: isReportUsageEnabled(),
       showCost: isShowCostEnabled(),
       showModel: isShowModelEnabled(),
@@ -3517,6 +3531,15 @@ Write the file using the write tool. Only write the file, nothing else.`;
   const NUMERIC_IDS = new Set([
     "maxConcurrent", "maxConcurrentForeground", "defaultMaxTurns", "graceTurns", "maxSubagentDepth",
   ]);
+
+  /**
+   * Settings edited by typing a free-form string: Enter closes the list and
+   * opens `ctx.ui.input`, exactly like NUMERIC_IDS but without the integer
+   * validation (and with an empty value allowed — it is how a project clears a
+   * global default).
+   */
+  const TEXT_INPUT_IDS = new Set(["defaultModel"]);
+  const isPromptedId = (id: string): boolean => NUMERIC_IDS.has(id) || TEXT_INPUT_IDS.has(id);
 
   async function showSettings(ctx: ExtensionCommandContext) {
     function buildItems(): SettingItem[] {
@@ -3597,6 +3620,22 @@ Write the file using the write tool. Only write the file, nothing else.`;
             "Scripted workflows, on unless another extension provides a workflow tool "
             + "(off keeps the SubagentWorkflow tool out of the tool spec; applies on next pi session)",
           currentValue: isWorkflowsEnabled() ? "on" : "off",
+          values: ["on", "off"],
+        },
+        {
+          id: "defaultModel",
+          label: "Default model",
+          description:
+            "Model for subagents that don't name one — provider/modelId or a fuzzy name like `haiku` (Enter to type; empty clears a global default). Loses to the Agent call's model and an agent file's model: frontmatter; set Force default model to make it win.",
+          currentValue: getDefaultModel() || "(inherit parent)",
+          values: [getDefaultModel() ?? ""],
+        },
+        {
+          id: "forceDefaultModel",
+          label: "Force default model",
+          description:
+            "Make Default model outrank every other choice — the Agent call's model, an agent file's frontmatter, workflow scripts, the RPC payload and the parent model. Requires Default model, or spawns fail with a configuration error. Applied to resumes too.",
+          currentValue: isForceDefaultModel() ? "on" : "off",
           values: ["on", "off"],
         },
         {
@@ -3792,6 +3831,26 @@ Write the file using the write tool. Only write the file, nothing else.`;
             `Workflows ${enabled ? "enabled" : "disabled"}. Tool spec change takes effect on next pi session.`,
           );
         }
+      } else if (id === "defaultModel") {
+        const trimmed = value.trim();
+        // "" is stored (not undefined): it is how a project clears a globally
+        // configured model, and the snapshot writes it back verbatim.
+        setDefaultModel(trimmed);
+        notifyApplied(
+          ctx,
+          trimmed
+            ? `Default model set to ${trimmed}${isForceDefaultModel() ? " (forced)" : ""}`
+            : "Default model cleared",
+        );
+      } else if (id === "forceDefaultModel") {
+        const enabled = value === "on";
+        setForceDefaultModel(enabled);
+        notifyApplied(
+          ctx,
+          enabled
+            ? "Force default model on — every subagent uses the Default model; set Default model first or spawns fail"
+            : "Force default model off",
+        );
       } else if (id === "scopeModels") {
         const enabled = value === "on";
         setScopeModelsEnabled(enabled);
@@ -3907,8 +3966,8 @@ Write the file using the write tool. Only write the file, nothing else.`;
             currentIndex = Math.min(items.length - 1, currentIndex + 1);
           }
 
-          // Enter on numeric field → close and prompt for typed input
-          if (matchesKey(data, Key.enter) && NUMERIC_IDS.has(items[currentIndex].id)) {
+          // Enter on a numeric/free-text field → close and prompt for typed input
+          if (matchesKey(data, Key.enter) && isPromptedId(items[currentIndex].id)) {
             done(items[currentIndex].id);
             return;
           }
@@ -3952,6 +4011,20 @@ Write the file using the write tool. Only write the file, nothing else.`;
         }
         // Invalid — re-prompt with the user's last entry so they can edit it
         input = await ctx.ui.input(label, trimmed);
+      }
+    }
+
+    // Free-form string field (defaultModel): same close-and-prompt flow, but no
+    // integer parsing and an empty entry is a valid value ("clear").
+    if (result && TEXT_INPUT_IDS.has(result)) {
+      const input = await ctx.ui.input(
+        "Default model (provider/modelId or fuzzy name; empty clears)",
+        getDefaultModel() ?? "",
+      );
+      if (input != null) {
+        applyValue(result, input);
+        await showSettings(ctx);
+        return;
       }
     }
   }

@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getAvailableTypes, registerAgents, setFallbackSubagent } from "../src/agent-types.js";
 import { loadCustomAgents } from "../src/custom-agents.js";
+import { setDefaultModel, setForceDefaultModel } from "../src/model-policy.js";
 import { setScopeModelsEnabled } from "../src/model-scope.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager, setMaxSubagentDepth } from "../src/nested-tools.js";
 import { encodeCwd } from "../src/output-file.js";
@@ -561,5 +562,62 @@ describe("setMaxSubagentDepth clamping", () => {
   it("stores a valid depth unchanged", () => {
     setMaxSubagentDepth(3);
     expect(getMaxSubagentDepth()).toBe(3);
+  });
+});
+
+describe("nested spawns honour defaultModel / forceDefaultModel", () => {
+  const spawnedModel = () => spawnAndWait.mock.calls.at(-1)?.[4]?.model;
+
+  afterEach(() => {
+    setDefaultModel(undefined);
+    setForceDefaultModel(false);
+  });
+
+  it("uses the configured default when neither the call nor the agent file names a model", async () => {
+    setDefaultModel("anthropic/allowed");
+    const [agent] = tools();
+
+    const result = await execute(agent, { subagent_type: "reviewer", description: "d", prompt: "p" });
+
+    expect(result.isError).toBe(false);
+    expect(spawnedModel()).toMatchObject({ provider: "anthropic", id: "allowed" });
+  });
+
+  it("still lets an agent file's frontmatter outrank the default", async () => {
+    writeAgent("reviewer", "model: anthropic/blocked\n");
+    registerAgents(loadCustomAgents(cwd));
+    setDefaultModel("anthropic/allowed");
+    const [agent] = tools();
+
+    await execute(agent, { subagent_type: "reviewer", description: "d", prompt: "p" });
+
+    expect(spawnedModel()).toMatchObject({ id: "blocked" });
+  });
+
+  it("force overrides a nested caller's model", async () => {
+    setDefaultModel("anthropic/allowed");
+    setForceDefaultModel(true);
+    const [agent] = tools();
+
+    const result = await execute(agent, {
+      subagent_type: "reviewer",
+      description: "d",
+      prompt: "p",
+      model: "anthropic/blocked",
+    });
+
+    expect(result.isError).toBe(false);
+    expect(spawnedModel()).toMatchObject({ id: "allowed" });
+  });
+
+  it("fails closed under force with no default configured", async () => {
+    setForceDefaultModel(true);
+    const [agent] = tools();
+
+    const result = await execute(agent, { subagent_type: "reviewer", description: "d", prompt: "p" });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text ?? "").toContain("forceDefaultModel is enabled but defaultModel is not set");
+    expect(spawnAndWait).not.toHaveBeenCalled();
   });
 });

@@ -328,7 +328,7 @@ All fields are optional — sensible defaults for everything.
 | `isolated` | `false` | Hermetic specialist mode: forces `extensions: false` + `skills: false` + drops `ext:` selectors. Only built-in tools. Distinct from `isolation: worktree` (filesystem) |
 | `enabled` | `true` | Set to `false` to disable an agent (useful for hiding a default agent per-project) |
 
-Frontmatter is authoritative. If an agent file sets `model`, `thinking`, `max_turns`, `inherit_context`, `run_in_background`, `isolated`, or `isolation`, those values are locked for that agent. `Agent` tool parameters only fill fields the agent config leaves unspecified.
+Frontmatter is authoritative. If an agent file sets `model`, `thinking`, `max_turns`, `inherit_context`, `run_in_background`, `isolated`, or `isolation`, those values are locked for that agent. `Agent` tool parameters only fill fields the agent config leaves unspecified. The project/global `forceDefaultModel` setting is an explicit exception for `model`: when enabled, every subagent uses `defaultModel`, including agents with a frontmatter model pin.
 
 **Forgiving `model:` resolution.** A `model:` pin is matched against pi's model registry tolerantly, so cosmetic id variations don't silently drop the agent back to the parent's model: `.` and `-` are treated as equivalent in version numbers (`claude-haiku-4.5` ≡ `claude-haiku-4-5`), a trailing `-YYYYMMDD` date stamp is optional (`anthropic/claude-haiku-4-5-20251001` matches an undated registry id and vice-versa), and a `provider/modelId` whose named provider doesn't carry that model retries the bare id against every provider. Precedence is **exact → fuzzy under the named provider → same model under any provider → unavailable**, so an exact match always wins and dated snapshots aren't conflated. If nothing resolves, the pin can't run and the agent inherits the parent model — `/agents → Agent types` flags this case as `(unavailable, fallback: inherit)` and shows the resolved target `(→ provider/id)` when resolution lands on a different provider or version than configured. (This is distinct from [Model Scope](#model-scope) enforcement, which matches the `enabledModels` allowlist by *exact* entry.)
 
@@ -545,7 +545,7 @@ Settings                                    ← max concurrency (background + fo
 - **Eject** — writes the embedded default config as a `.md` file to project or personal location, so you can customize it
 - **Disable/Enable** — toggle agent availability. Disabled agents stay visible in the list (marked `✕`) and can be re-enabled
 - **Create new agent** — choose project/personal location, then manual wizard (step-by-step prompts for name, tools, model, thinking, system prompt) or AI-generated (describe what the agent should do and a sub-agent writes the `.md` file). Any name is allowed, including default agent names (overrides them)
-- **Settings** — configure max concurrency (background and foreground), default max turns, grace turns, and join mode at runtime
+- **Settings** — configure max concurrency (background and foreground), default max turns, grace turns, default model, force default model, and join mode at runtime
 
 ## Graceful Max Turns
 
@@ -604,9 +604,10 @@ When on, each subagent spawn's effective model is validated against pi's own `en
 | Caller-supplied via `Agent({ model: "..." })` | Hard error returned to the orchestrator, listing allowed models |
 | Caller-supplied via cross-extension RPC (`subagents:rpc:spawn`, e.g. pi-tasks `TaskExecute`) | Hard error returned to the calling extension, listing allowed models |
 | Pinned in agent frontmatter | Warning toast + the pinned model runs (frontmatter is authoritative) |
+| Configured `defaultModel` / forced `forceDefaultModel` | Warning toast + the configured model runs (user-level config, like frontmatter) |
 | Parent-inherited (neither set) | Warning toast + parent's model runs |
 
-**Design:** `scopeModels` is a guardrail against the orchestrator picking unexpected models at runtime, not a hard policy against user-level config. The "frontmatter is authoritative" guarantee from v0.5.1 still holds for `model:` — caller params can't override frontmatter, and frontmatter pins run even when out of scope (with a visible warning).
+**Design:** `scopeModels` is a guardrail against the orchestrator picking unexpected models at runtime, not a hard policy against user-level config. Caller params can't override frontmatter, and frontmatter pins run even when out of scope (with a visible warning), unless `forceDefaultModel` replaces the pin with the configured default.
 
 **Nested spawns** ([nested subagents](#nested-subagents)) apply the same table against the parent's config root. The hard-error case is identical; the warning cases proceed silently, since a subagent session has no UI to toast to.
 
@@ -616,7 +617,7 @@ When on, each subagent spawn's effective model is validated against pi's own `en
 
 ## Persistent Settings
 
-Runtime tuning values set via `/agents` → Settings (max concurrency, max foreground concurrency, default max turns, grace turns, nested depth, fallback agent, default join mode, scheduling on/off, scope models on/off, disable defaults on/off, strict agent files on/off, agent mentions on/off, output transcript on/off, tool description full/compact/custom, widget all/background/off, usage reporting on/off, cost display on/off, model display on/off, viewer markdown off/assistant/all) persist across pi restarts. Two files, merged on load:
+Runtime tuning values set via `/agents` → Settings (max concurrency, max foreground concurrency, default max turns, grace turns, nested depth, fallback agent, default join mode, default model, force default model, scheduling on/off, scope models on/off, disable defaults on/off, strict agent files on/off, agent mentions on/off, output transcript on/off, tool description full/compact/custom, widget all/background/off, usage reporting on/off, cost display on/off, model display on/off, viewer markdown off/assistant/all) persist across pi restarts. Two files, merged on load:
 
 - **Global:** `~/.pi/agent/subagents.json` — your machine-wide defaults. Edit by hand; the `/agents` menu never writes here.
 - **Project:** `<cwd>/.pi/subagents.json` — per-project overrides. Written by `/agents` → Settings.
@@ -640,6 +641,19 @@ Rules appear in a `<subagent_instructions>` section in both `append` and `replac
 **Nested depth** (`maxSubagentDepth`, default `2`): the hard ceiling on [nested delegation](#nested-subagents), counted from the main session (main = 0, its subagents = 1). `0` or `1` disables nesting project-wide regardless of any agent's `allowed_subagents`. Read when a subagent session is built, so a change applies to agents started after it.
 
 **Fallback agent** (`fallbackSubagent`, default `general-purpose`): the agent used when a caller-supplied `subagent_type` doesn't resolve to exactly one enabled agent — unknown, disabled, or ambiguous because two agents differ only by case. Name any enabled agent to route those calls there instead, or set `none` for **strict**, fail-closed dispatch: the call is refused with an error listing the available types, and nothing spawns. Strict mode matters most for background and scheduled calls, which would otherwise start executing a substituted agent before the caller learns anything. Also settable from `/agents → Settings → Fallback agent`. The boolean `false` is accepted as a spelling of `none`, because it would otherwise be dropped as the wrong type and silently leave the permissive default in place. Every other value is read as an agent name, so a mistaken `off` fails loudly at dispatch rather than meaning one thing in the settings file and another in the resolver. A fallback agent that is itself unknown or disabled is a misconfiguration and is reported rather than quietly replaced. Note the default is unchanged and stays permissive by design: with `disableDefaultAgents` and no `general-purpose` of your own, an unresolvable type still resolves to a built-in config carrying *all* tools — set `none` (or name one of your own agents) to close that.
+
+**Default model** (`defaultModel`, default unset): the model a subagent runs on when nothing else names one — `"provider/modelId"` or any fuzzy spelling the `Agent` `model:` parameter accepts (e.g. `"haiku"`). It sits **below** a caller's `model:` and an agent file's `model:` frontmatter and **above** the inherited parent model, so it only decides the cases that used to fall through to the parent. Set it in `/agents → Settings → Default model` (Enter to type; an empty value clears it) or by hand. A configured model that cannot be resolved fails the spawn with the resolution error rather than silently inheriting the parent — the setting exists to make these agents run a particular way — and under [Model Scope](#model-scope) it warns rather than hard-erroring, because it is user config, not an orchestrator choice. `""` in a project file clears a globally configured default. The precedence is resolved by one function (`model-policy.ts`) for the `Agent` tool, [nested spawns](#nested-subagents), workflow `agent({ model })`, scheduled jobs, [cross-extension RPC](#cross-extension-rpc) and `@handle` mentions, so no surface can drift from another.
+
+For example, to use one model for every subagent, add these fields to your global or project `subagents.json`:
+
+```json
+{
+  "defaultModel": "deepseek/deepseek-v4.1-flash",
+  "forceDefaultModel": true
+}
+```
+
+**Force default model** (`forceDefaultModel`, default `false`): makes `defaultModel` outrank *everything* — the `Agent({ model })` parameter, an agent file's `model:` frontmatter, a workflow script's `model:`, the RPC payload, the scheduler's job model and the parent model. It needs `defaultModel`: with force on and no default configured, every spawn fails with a configuration error instead of quietly falling back, and a configured default that cannot be resolved fails the same way. The model being overridden is never resolved, so a typo in a caller's `model:` cannot fail a call whose model is being replaced. Resumes are covered too — an existing session is switched onto the forced default before its next turn, and a persisted conversation reopened in a new pi session has it re-applied after the session file's recorded model — so `resume` is not a route around the setting. Toggle via `/agents → Settings → Force default model`; applied live.
 
 **Strict agent files** (`strictAgentFiles`, default `false`): when on, an unreadable or unparseable [agent file](#custom-agents) aborts extension load at startup and names the file, instead of being skipped with a warning — so a checked-in `.pi/agents/` can't silently fall through to a same-named agent from another location. Startup only: the mid-session reload that runs on each `Agent` call keeps warning either way, since a bad edit shouldn't kill a session on an unrelated spawn. Also settable from `/agents → Settings → Strict agent files`.
 
@@ -1008,6 +1022,7 @@ src/
   model-resolver.ts   # Model resolution: exact provider/modelId with fuzzy fallback
   enabled-models.ts   # Read pi's enabledModels settings (project over global)
   model-scope.ts      # scopeModels allowlist policy, shared by top-level and nested tools
+  model-policy.ts     # defaultModel / forceDefaultModel precedence, shared by every spawn path
   mention.ts          # `@handle message` grammar: suggestion triggers and send parsing
   mention-clone.ts    # Run a mention's turn in a cloned conversation, off the main chat
   cross-extension-rpc.ts # RPC handlers for cross-extension spawn/ping via pi.events
