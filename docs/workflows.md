@@ -27,7 +27,7 @@ There is no `/workflows` command. The tool is model-invoked, so you get a workfl
 | "fix the failing test, and don't tell me it's done until `npm test` passes" | A `gate` on the fix agent, and a retry loop around it |
 | "use a workflow to …" | Forces the shape when the model would otherwise reach for plain `Agent` calls |
 
-You do not have to say "workflow" — the model picks the tool — but saying it removes the ambiguity when the task is borderline.
+You do not have to say "workflow" or separately authorize orchestration — the model picks the tool when the task warrants it. Saying "use a workflow" removes the ambiguity when the task is borderline. Workflows can spawn many agents and consume substantial tokens, so the model should scale the work to your request rather than turn a simple task into a large run.
 
 ### 2. Read what came back
 
