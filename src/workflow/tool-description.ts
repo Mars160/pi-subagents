@@ -20,6 +20,8 @@
  *   - `parallel` propagates a fatal run error instead of folding it to null.
  *   - `effort` inherits the agent definition's level, then the parent's.
  *   - `isolation` removes the worktree on settle, changes kept on a branch.
+ * Deliberate local policy: omit Claude Code's explicit workflow opt-in rule;
+ * the model may select a workflow when the task warrants orchestration.
  * Additions with no upstream counterpart: `gate`, `resume`, `effort: "minimal"`,
  * the saved-workflow directories, and the reject-unknown-options guarantee.
  *
@@ -39,13 +41,6 @@
 export const fullWorkflowToolDescription = `Execute a workflow script that orchestrates multiple subagents deterministically. Workflows run in the background — this tool returns immediately with a task ID, and you are notified when the workflow completes. Use /agents → Workflows to watch live progress.
 
 A workflow structures work across many agents — to be comprehensive (decompose and cover in parallel), to be confident (independent perspectives and adversarial checks before committing), or to take on scale one context can't hold (migrations, audits, broad sweeps). The script is where you encode that structure: what fans out, what verifies, what synthesizes.
-
-ONLY call this tool when the user has explicitly opted into multi-agent orchestration. Workflows can spawn dozens of agents and consume a large amount of tokens; the user must request that scale, not have it inferred. Explicit opt-in means one of:
-- The user directly asked you to run a workflow or use multi-agent orchestration in their own words ("use a workflow", "run a workflow", "fan out agents", "orchestrate this with subagents"). The ask must be in the user's words — a task that would merely benefit from a workflow does not count.
-- The user invoked a skill or slash command whose instructions tell you to call SubagentWorkflow.
-- The user asked you to run a specific named or saved workflow.
-
-For any other task — even one that would clearly benefit from parallelism — do NOT call this tool. Use the Agent tool for individual subagents, or briefly describe what a multi-agent workflow could do and how much it would roughly cost, and ask the user whether to run it. Mention they can ask for one with "use a workflow" in a future message to skip the ask.
 
 When you do call it, the right move is often **hybrid**: scout inline first (list the files, find the channels, scope the diff) to discover the work-list, then call SubagentWorkflow to pipeline over it. You don't need to know the shape before the *task* — only before the *orchestration step*.
 

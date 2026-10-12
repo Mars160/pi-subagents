@@ -143,6 +143,15 @@ describe("the limits it quotes", () => {
   });
 });
 
+describe("workflow selection guidance", () => {
+  it("does not require explicit user opt-in before selecting a workflow", () => {
+    expect(description).not.toContain("ONLY call this tool when the user has explicitly opted into");
+    expect(description).not.toContain("Explicit opt-in means one of:");
+    expect(description).not.toContain("For any other task — even one that would clearly benefit from parallelism — do NOT call this tool.");
+    expect(description).not.toContain("ask the user whether to run it");
+  });
+});
+
 describe("rendering", () => {
   it("keeps the placeholder the live agent roster is substituted into", () => {
     expect(description).toContain("{{typeList}}");
