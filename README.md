@@ -25,6 +25,7 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 - **Session resume** — pick up where an agent left off, preserving full conversation context. Resumes detached by default and notifies you on completion, just like a fresh spawn; pass `run_in_background: false` to block and get the result inline
 - **Graceful turn limits** — agents get a "wrap up" warning before hard abort, producing clean partial results instead of cut-off output
 - **Case-insensitive agent types** — `"explore"`, `"Explore"`, `"EXPLORE"` all work. A type that doesn't resolve to exactly one *enabled* agent — unknown, disabled, or ambiguous between two agents differing only by case — falls back to general-purpose with a note, or is refused outright under [`fallbackSubagent: none`](#persistent-settings)
+- **Default and forced reasoning effort** — configure `defaultEffort` for subagents that do not specify a thinking level, or enable `forceDefaultEffort` to override caller parameters, agent frontmatter and workflow effort, including resumed sessions
 - **Fuzzy model selection** — specify models by name (`"haiku"`, `"sonnet"`) instead of full IDs, with automatic filtering to only available/configured models
 - **Context inheritance** — optionally fork the parent conversation into a sub-agent so it knows what's been discussed
 - **Persistent agent memory** — three scopes (project, local, user) with automatic read-only fallback for agents without write tools
@@ -328,7 +329,7 @@ All fields are optional — sensible defaults for everything.
 | `isolated` | `false` | Hermetic specialist mode: forces `extensions: false` + `skills: false` + drops `ext:` selectors. Only built-in tools. Distinct from `isolation: worktree` (filesystem) |
 | `enabled` | `true` | Set to `false` to disable an agent (useful for hiding a default agent per-project) |
 
-Frontmatter is authoritative. If an agent file sets `model`, `thinking`, `max_turns`, `inherit_context`, `run_in_background`, `isolated`, or `isolation`, those values are locked for that agent. `Agent` tool parameters only fill fields the agent config leaves unspecified. The project/global `forceDefaultModel` setting is an explicit exception for `model`: when enabled, every subagent uses `defaultModel`, including agents with a frontmatter model pin.
+Frontmatter is authoritative. If an agent file sets `model`, `thinking`, `max_turns`, `inherit_context`, `run_in_background`, `isolated`, or `isolation`, those values are locked for that agent. `Agent` tool parameters only fill fields the agent config leaves unspecified. The project/global `forceDefaultModel` setting is an explicit exception for `model`: when enabled, every subagent uses `defaultModel`, including agents with a frontmatter model pin. `forceDefaultEffort` is the matching exception for `thinking`: when enabled, `defaultEffort` overrides both frontmatter and caller thinking levels.
 
 **Forgiving `model:` resolution.** A `model:` pin is matched against pi's model registry tolerantly, so cosmetic id variations don't silently drop the agent back to the parent's model: `.` and `-` are treated as equivalent in version numbers (`claude-haiku-4.5` ≡ `claude-haiku-4-5`), a trailing `-YYYYMMDD` date stamp is optional (`anthropic/claude-haiku-4-5-20251001` matches an undated registry id and vice-versa), and a `provider/modelId` whose named provider doesn't carry that model retries the bare id against every provider. Precedence is **exact → fuzzy under the named provider → same model under any provider → unavailable**, so an exact match always wins and dated snapshots aren't conflated. If nothing resolves, the pin can't run and the agent inherits the parent model — `/agents → Agent types` flags this case as `(unavailable, fallback: inherit)` and shows the resolved target `(→ provider/id)` when resolution lands on a different provider or version than configured. (This is distinct from [Model Scope](#model-scope) enforcement, which matches the `enabledModels` allowlist by *exact* entry.)
 
@@ -416,7 +417,7 @@ Launch a sub-agent.
 | `name` | string | no | Memorable name for this agent (`auth-audit`), addressable as `@name` and accepted by `steer_subagent`/`get_subagent_result`. Additive — the type-derived handle is still assigned |
 | `subagent_type` | string | yes | Agent type (built-in or custom) |
 | `model` | string | no | Model — `provider/modelId` or fuzzy name (`"haiku"`, `"sonnet"`). Resolved tolerantly (`.`/`-` and a trailing date stamp interchangeable) with provider fallback |
-| `thinking` | string | no | Thinking level: off, minimal, low, medium, high, xhigh, max (availability depends on pi version and model) |
+| `thinking` | string | no | Thinking level: off, minimal, low, medium, high, xhigh, max (availability depends on pi version and model). Agent frontmatter wins over this parameter; `defaultEffort` fills in when neither sets one, and `forceDefaultEffort` overrides both |
 | `max_turns` | number | no | Max agentic turns. Omit for unlimited (default) |
 | `run_in_background` | boolean | no | Defaults to `true`; `false` blocks and returns the result inline |
 | `resume` | string | no | Agent ID to resume a previous session |
@@ -545,7 +546,7 @@ Settings                                    ← max concurrency (background + fo
 - **Eject** — writes the embedded default config as a `.md` file to project or personal location, so you can customize it
 - **Disable/Enable** — toggle agent availability. Disabled agents stay visible in the list (marked `✕`) and can be re-enabled
 - **Create new agent** — choose project/personal location, then manual wizard (step-by-step prompts for name, tools, model, thinking, system prompt) or AI-generated (describe what the agent should do and a sub-agent writes the `.md` file). Any name is allowed, including default agent names (overrides them)
-- **Settings** — configure max concurrency (background and foreground), default max turns, grace turns, default model, force default model, and join mode at runtime
+- **Settings** — configure max concurrency (background and foreground), default max turns, grace turns, default model, force default model, default effort, force default effort, and join mode at runtime
 
 ## Graceful Max Turns
 
@@ -617,7 +618,7 @@ When on, each subagent spawn's effective model is validated against pi's own `en
 
 ## Persistent Settings
 
-Runtime tuning values set via `/agents` → Settings (max concurrency, max foreground concurrency, default max turns, grace turns, nested depth, fallback agent, default join mode, default model, force default model, scheduling on/off, scope models on/off, disable defaults on/off, strict agent files on/off, agent mentions on/off, output transcript on/off, tool description full/compact/custom, widget all/background/off, usage reporting on/off, cost display on/off, model display on/off, viewer markdown off/assistant/all) persist across pi restarts. Two files, merged on load:
+Runtime tuning values set via `/agents` → Settings (max concurrency, max foreground concurrency, default max turns, grace turns, nested depth, fallback agent, default join mode, default model, force default model, default effort, force default effort, scheduling on/off, scope models on/off, disable defaults on/off, strict agent files on/off, agent mentions on/off, output transcript on/off, tool description full/compact/custom, widget all/background/off, usage reporting on/off, cost display on/off, model display on/off, viewer markdown off/assistant/all) persist across pi restarts. Two files, merged on load:
 
 - **Global:** `~/.pi/agent/subagents.json` — your machine-wide defaults. Edit by hand; the `/agents` menu never writes here.
 - **Project:** `<cwd>/.pi/subagents.json` — per-project overrides. Written by `/agents` → Settings.
@@ -654,6 +655,21 @@ For example, to use one model for every subagent, add these fields to your globa
 ```
 
 **Force default model** (`forceDefaultModel`, default `false`): makes `defaultModel` outrank *everything* — the `Agent({ model })` parameter, an agent file's `model:` frontmatter, a workflow script's `model:`, the RPC payload, the scheduler's job model and the parent model. It needs `defaultModel`: with force on and no default configured, every spawn fails with a configuration error instead of quietly falling back, and a configured default that cannot be resolved fails the same way. The model being overridden is never resolved, so a typo in a caller's `model:` cannot fail a call whose model is being replaced. Resumes are covered too — an existing session is switched onto the forced default before its next turn, and a persisted conversation reopened in a new pi session has it re-applied after the session file's recorded model — so `resume` is not a route around the setting. Toggle via `/agents → Settings → Force default model`; applied live.
+
+**Default effort** (`defaultEffort`, default unset): the thinking level used when neither the caller nor the agent definition specifies one. Accepted values are `minimal`, `low`, `medium`, `high`, `xhigh` and `max`; pi adjusts the requested level to what the selected model supports. Set it in `/agents → Settings → Default effort` (Enter to type; empty clears it) or in `subagents.json`. A project-level `""` clears a global default; invalid file values are dropped. With no default or explicit level, pi's own session default applies.
+
+**Force default effort** (`forceDefaultEffort`, default `false`): makes `defaultEffort` override caller `thinking`, agent-file `thinking:` and workflow `effort`. It also applies to nested agents, scheduled jobs, cross-extension RPC and `@handle` mentions. Enabling force without a valid, non-empty `defaultEffort` fails the spawn with a configuration error. Existing sessions and persisted conversations reopened from disk have the forced level re-applied before their next turn, adjusted to the actual session model's supported levels; this does not change pi's global thinking default. Toggle via `/agents → Settings → Force default effort`; runtime enforcement applies live, while the policy text appended to the Agent description (full, compact or custom) and SubagentWorkflow description updates on the next pi session.
+
+For example, to request `high` reasoning for every subagent, add these fields to your global or project `subagents.json`:
+
+```json
+{
+  "defaultEffort": "high",
+  "forceDefaultEffort": true
+}
+```
+
+Without force, the Agent tool and nested calls prefer frontmatter over caller `thinking`; workflow scripts prefer their `effort` over frontmatter. The configured default only fills in when that winner is unset. See [workflow effort](docs/workflows.md#agentprompt-opts) for resume combination rules.
 
 **Strict agent files** (`strictAgentFiles`, default `false`): when on, an unreadable or unparseable [agent file](#custom-agents) aborts extension load at startup and names the file, instead of being skipped with a warning — so a checked-in `.pi/agents/` can't silently fall through to a same-named agent from another location. Startup only: the mid-session reload that runs on each `Agent` call keeps warning either way, since a bad edit shouldn't kill a session on an unrelated spawn. Also settable from `/agents → Settings → Strict agent files`.
 
@@ -1023,6 +1039,7 @@ src/
   enabled-models.ts   # Read pi's enabledModels settings (project over global)
   model-scope.ts      # scopeModels allowlist policy, shared by top-level and nested tools
   model-policy.ts     # defaultModel / forceDefaultModel precedence, shared by every spawn path
+  effort-policy.ts    # defaultEffort / forceDefaultEffort precedence and forced resume clamping
   mention.ts          # `@handle message` grammar: suggestion triggers and send parsing
   mention-clone.ts    # Run a mention's turn in a cloned conversation, off the main chat
   cross-extension-rpc.ts # RPC handlers for cross-extension spawn/ping via pi.events

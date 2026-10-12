@@ -20,7 +20,7 @@ For the channel list, the reply envelope, the per-channel snippets and the event
 | `maxTurns` | number | Turn ceiling for the run |
 | `isolated` | boolean | Strips extensions, skills and nested tools. **Not** a git worktree — see the trap table below |
 | `inheritContext` | boolean | Fork the parent conversation into the child |
-| `thinkingLevel` | ThinkingLevel | Clamped to what the resolved model supports |
+| `thinkingLevel` | ThinkingLevel | Clamped to what the resolved model supports. Takes precedence over agent frontmatter on this programmatic path; `defaultEffort` fills in when neither sets a level, and `forceDefaultEffort` overrides both |
 | `isBackground` | boolean | Occupies a `maxConcurrent` slot and queues behind them. Every RPC spawn runs detached regardless; this is what decides whether it is *pooled* |
 | `bypassQueue` | boolean | Starts immediately even when the concurrency limit would queue it. The slot is still counted once running |
 | `structuredOutput` | CompiledSchema | Makes the child report through a `StructuredOutput` tool |
@@ -52,6 +52,8 @@ Four things that are not obvious from the tables:
 - **`structuredOutput` is documented "set only by the workflow host"** (`src/agent-manager.ts:231-234`) and is also not stripped.
 - **`signal` and the `on*` callbacks are function values.** They work only because the bus is in-process. A caller that genuinely serializes its payload cannot use them, and they arrive as `undefined` rather than failing.
 - **The project's model configuration can overrule the payload.** With `defaultModel` set, a payload that sends no model runs on it instead of inheriting; with `forceDefaultModel` on, the configured model replaces the payload's — and the ignored model is never resolved, so an unresolvable one still succeeds. Both are user config, so under [Model Scope](../README.md#model-scope) they warn rather than hard-error, while a caller-supplied model keeps its hard error. See [Default model](../README.md#persistent-settings).
+
+**Reasoning effort policy applies to RPC and registry spawns too.** The parent session's `defaultEffort` supplies a level when both `options.thinkingLevel` and the agent definition's `thinking:` are unset. With `forceDefaultEffort` on, `defaultEffort` replaces both; a missing or invalid forced default fails the run rather than inheriting an arbitrary level. The same policy applies to resumed sessions without changing pi's global thinking default. Configure these in `subagents.json` or `/agents → Settings`; see [Persistent settings](../README.md#persistent-settings).
 
 ### Names that look right and are not
 

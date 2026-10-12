@@ -240,7 +240,7 @@ Spawns one subagent and resolves to its final text — or, with `schema`, to a v
 | `phase` | string | Put this agent in a named group, overriding the ambient `phase()`. **Use it inside `pipeline`/`parallel` stages**, where the ambient phase races |
 | `agentType` | string | Which agent definition to use. Defaults to `general-purpose`; built-ins are `general-purpose`, `Explore`, `Plan`, plus your custom agents |
 | `model` | string | `provider/modelId`, or fuzzy like `haiku`. Outranks the agent definition's own `model:`. A project's `defaultModel` fills in when neither names one; with `forceDefaultModel` on, the project's model wins over this option too |
-| `effort` | string | `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Omitted, the agent definition's own `thinking` decides, then the parent's |
+| `effort` | string | `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Outranks the agent definition's `thinking`; omitted, frontmatter decides, then `defaultEffort`, then pi's own session default. With `forceDefaultEffort` on, the configured default overrides this option and frontmatter |
 | `isolation` | `"worktree"` | Run in a throwaway git worktree. Only when agents write files in parallel and would collide — it costs setup time and disk per agent |
 | `gate` | string | A shell command run after the agent finishes; a non-zero exit fails the agent and its output becomes the error |
 | `resume` | string | Continue the child that ran under that label instead of starting fresh |
@@ -248,7 +248,9 @@ Spawns one subagent and resolves to its final text — or, with `schema`, to a v
 
 Any other key is rejected **by name** at the call. Note that this checks option *keys*, not option *values* — an `agentType` that names no known agent falls back to `general-purpose` silently.
 
-Combination rules: `resume` cannot be combined with `agentType`, `model`, `effort`, `isolation`, `gate` or `schema` — a resumed child keeps the agent type, model and tree it was started with, and its session predates the `StructuredOutput` tool. A project's `forceDefaultModel` is the exception: a resumed child's session is switched onto the forced default before its next turn, so a `defaultModel`/`forceDefaultModel` pair (see [Persistent settings](../README.md#persistent-settings)) is not a route around it.
+Combination rules: `resume` cannot be combined with `agentType`, `model`, `effort`, `isolation`, `gate` or `schema` — a resumed child keeps the agent type, model, thinking level and tree it was started with, and its session predates the `StructuredOutput` tool. Project-level forced defaults are exceptions: `forceDefaultModel` switches a resumed child's active model, and `forceDefaultEffort` re-applies `defaultEffort`, adjusted to the actual model's supported levels, before its next turn. See [Persistent settings](../README.md#persistent-settings).
+
+With `forceDefaultEffort` enabled when the workflow starts, script `effort` values are ignored for execution: even invalid values do not fail validation, and `effort` alongside `resume` is accepted because it cannot change the forced level. Valid requested levels are retained for display when they differ from the effective level (`thinking: high (asked max)`). The other resume exclusions remain unchanged. Force requires a valid, non-empty `defaultEffort`; otherwise the child fails and `agent()` returns `null` rather than silently choosing another level.
 
 ### `pipeline()` and `parallel()`
 
