@@ -284,6 +284,46 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({ defaultModel: "" });
   });
 
+  it("round-trips defaultEffort, including the empty-string clear", () => {
+    saveSettings({ defaultEffort: "high" }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ defaultEffort: "high" });
+    // "" is a real value (a project clearing a global default), not an absent
+    // field, so it has to survive the sanitizer and the write.
+    saveSettings({ defaultEffort: "" }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ defaultEffort: "" });
+  });
+
+  it("trims defaultEffort but keeps whitespace-only as the clear", () => {
+    writeProject({ defaultEffort: "  medium  " });
+    expect(loadSettings(projectDir)).toEqual({ defaultEffort: "medium" });
+    writeProject({ defaultEffort: "   " });
+    expect(loadSettings(projectDir)).toEqual({ defaultEffort: "" });
+  });
+
+  it("drops an unknown defaultEffort spelling instead of passing it to a session", () => {
+    writeProject({ defaultEffort: "turbo" });
+    expect(loadSettings(projectDir)).toEqual({});
+    writeProject({ defaultEffort: "off" });
+    expect(loadSettings(projectDir)).toEqual({});
+    writeProject({ defaultEffort: 42 });
+    expect(loadSettings(projectDir)).toEqual({});
+  });
+
+  it("lets a project clear a global defaultEffort with an empty string", () => {
+    writeGlobal({ defaultEffort: "xhigh" });
+    writeProject({ defaultEffort: "" });
+    expect(loadSettings(projectDir)).toEqual({ defaultEffort: "" });
+  });
+
+  it("round-trips forceDefaultEffort; drops non-boolean", () => {
+    saveSettings({ forceDefaultEffort: true }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ forceDefaultEffort: true });
+    saveSettings({ forceDefaultEffort: false }, projectDir);
+    expect(loadSettings(projectDir)).toEqual({ forceDefaultEffort: false });
+    writeProject({ forceDefaultEffort: "on" } as any);
+    expect(loadSettings(projectDir)).toEqual({});
+  });
+
   it("trims defaultModel but keeps whitespace-only as the clear", () => {
     writeProject({ defaultModel: "  anthropic/claude-haiku-4-5  " });
     expect(loadSettings(projectDir)).toEqual({ defaultModel: "anthropic/claude-haiku-4-5" });
@@ -647,6 +687,8 @@ describe("settings persistence", () => {
         setSubagentInstructionsFile: vi.fn(),
         setDefaultModel: vi.fn(),
         setForceDefaultModel: vi.fn(),
+        setDefaultEffort: vi.fn(),
+        setForceDefaultEffort: vi.fn(),
       };
     });
 
@@ -851,6 +893,26 @@ describe("settings persistence", () => {
       expect(appliers.setForceDefaultModel).toHaveBeenCalledTimes(2); // absence is "use default (off)"
     });
 
+    it("applies defaultEffort, including the empty-string clear", () => {
+      applySettings({ defaultEffort: "xhigh" }, appliers);
+      expect(appliers.setDefaultEffort).toHaveBeenCalledWith("xhigh");
+      // "" must reach the applier: it is how a project clears a global default,
+      // and dropping it would silently re-inherit the global one.
+      applySettings({ defaultEffort: "" }, appliers);
+      expect(appliers.setDefaultEffort).toHaveBeenCalledWith("");
+      applySettings({}, appliers);
+      expect(appliers.setDefaultEffort).toHaveBeenCalledTimes(2); // absence is "use global/none"
+    });
+
+    it("applies forceDefaultEffort (both true and false)", () => {
+      applySettings({ forceDefaultEffort: true }, appliers);
+      expect(appliers.setForceDefaultEffort).toHaveBeenCalledWith(true);
+      applySettings({ forceDefaultEffort: false }, appliers);
+      expect(appliers.setForceDefaultEffort).toHaveBeenCalledWith(false);
+      applySettings({}, appliers);
+      expect(appliers.setForceDefaultEffort).toHaveBeenCalledTimes(2); // absence is "use default (off)"
+    });
+
     it("applies defaultMaxTurns: 0 as the explicit unlimited marker", () => {
       applySettings({ defaultMaxTurns: 0 }, appliers);
       expect(appliers.setDefaultMaxTurns).toHaveBeenCalledWith(0);
@@ -940,6 +1002,8 @@ describe("settings persistence", () => {
         setSubagentInstructionsFile: vi.fn(),
         setDefaultModel: vi.fn(),
         setForceDefaultModel: vi.fn(),
+        setDefaultEffort: vi.fn(),
+        setForceDefaultEffort: vi.fn(),
       };
     });
 

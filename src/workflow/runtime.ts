@@ -15,6 +15,7 @@
 
 import { cpus } from "node:os";
 import { Worker } from "node:worker_threads";
+import { isForceDefaultEffort } from "../effort-policy.js";
 import { type JournalKeyInput, journalKey, type WorkflowJournalEntry } from "./journal.js";
 import { type CompiledSchema, compileJsonSchema } from "./json-schema.js";
 import { extractMeta, type WorkflowMeta } from "./meta.js";
@@ -724,6 +725,10 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
       argsJson: options.args === undefined ? undefined : JSON.stringify(options.args),
       itemCap,
       nestedCap: options.nestedCap ?? WORKFLOW_NESTED_CAP,
+      // Read now: a forced defaultEffort makes the worker ignore (and not
+      // validate) every agent() effort, so it must know the policy before it
+      // rejects a level that would never be used.
+      forceEffort: isForceDefaultEffort(),
     },
   });
 

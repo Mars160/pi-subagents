@@ -73,6 +73,9 @@ const vm = require("node:vm");
 
 const port = parentPort;
 const ITEM_CAP = workerData.itemCap;
+/* A forced defaultEffort makes every agent() level ignored, so validating or
+ * rejecting one would fail a call whose value never reaches a session. */
+const FORCE_EFFORT = workerData.forceEffort === true;
 const PRELUDE = ${JSON.stringify(DETERMINISM_PRELUDE)};
 
 /* ------------------------------------------------------------------ *
@@ -466,7 +469,11 @@ async function agentIn(scope, prompt, opts) {
   }
   const gate = optionalText(options.gate, "agent() opts.gate");
   const resume = optionalText(options.resume, "agent() opts.resume");
-  const effort = optionalText(options.effort, "agent() opts.effort");
+  // Under force, discard ignored invalid values before parsing or cloning them.
+  // Keep valid levels only as requested-effort metadata for the host's display.
+  const effort = FORCE_EFFORT
+    ? (EFFORT_LEVELS.indexOf(options.effort) !== -1 ? options.effort : undefined)
+    : optionalText(options.effort, "agent() opts.effort");
   const schema = options.schema;
   if (schema !== undefined) {
     if (typeof schema !== "object" || schema === null || Array.isArray(schema)) {
@@ -477,7 +484,7 @@ async function agentIn(scope, prompt, opts) {
     // value gets.
     checkBoundary(schema, "agent() opts.schema");
   }
-  if (effort !== undefined && EFFORT_LEVELS.indexOf(effort) === -1) {
+  if (!FORCE_EFFORT && effort !== undefined && EFFORT_LEVELS.indexOf(effort) === -1) {
     throw new Error("agent() opts.effort must be one of: " + EFFORT_LEVELS.join(", ") + ".");
   }
 
@@ -501,7 +508,7 @@ async function agentIn(scope, prompt, opts) {
         "agent() opts.resume and opts.isolation are mutually exclusive: a resumed agent keeps the working tree it was started in."
       );
     }
-    if (effort !== undefined) {
+    if (!FORCE_EFFORT && effort !== undefined) {
       throw new Error(
         "agent() opts.resume and opts.effort are mutually exclusive: a resumed agent keeps the reasoning effort it was started with."
       );

@@ -21,6 +21,7 @@ import { BUILTIN_TOOL_NAMES, getAgentConfig, getConfig, getMemoryToolNames, getR
 import { runInChildSessionContext } from "./child-context.js";
 import { buildParentContext, extractText } from "./context.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
+import { resolveEffectiveEffort, resolveForcedEffort } from "./effort-policy.js";
 import { detectEnv } from "./env.js";
 import { type GenerationStats, subscribeGeneration } from "./generation.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
@@ -881,8 +882,14 @@ export async function runAgent(
   }
   model ??= ctx.model;
 
-  // Resolve thinking level: explicit option > agent config > undefined (inherit)
-  const thinkingLevel = options.thinkingLevel ?? agentConfig?.thinking;
+  // Resolve thinking level: forceDefaultEffort > explicit option > agent config
+  // > the configured defaultEffort > pi's own default. Computed here as well as
+  // at every tool/entry boundary because programmatic spawns (@handle, the
+  // manager registry, the scheduler, cross-extension RPC) come straight here.
+  // The forced branch ignores both inputs on purpose.
+  const effort = resolveEffectiveEffort(options.thinkingLevel ?? agentConfig?.thinking);
+  if (effort.error) throw new Error(effort.error);
+  const thinkingLevel = effort.level;
 
   const disallowedSet = agentConfig?.disallowedTools
     ? new Set(agentConfig.disallowedTools)
@@ -1067,6 +1074,22 @@ export async function runAgent(
     session.agent.state.model = model;
     session.sessionManager?.appendModelChange?.(model.provider, model.id);
   }
+  // Same hole for the level: a reopened session carries the level in its own
+  // file, so re-assert the forced one after it (every new-session path is
+  // already covered by the `thinkingLevel` option above). Assigning the agent's
+  // own state rather than calling `setThinkingLevel` avoids writing the value
+  // into the user's pi settings as a new global default.
+  if (options.resumeSessionFile) {
+    // Clamp against the reopened session's actual model, not the parent model
+    // that was passed to createAgentSession before the file was restored.
+    const forcedEffort = resolveForcedEffort(session.model ?? model);
+    if (forcedEffort.error) throw new Error(forcedEffort.error);
+    if (forcedEffort.level !== undefined && session.agent?.state
+      && session.agent.state.thinkingLevel !== forcedEffort.level) {
+      session.agent.state.thinkingLevel = forcedEffort.level;
+      session.sessionManager?.appendThinkingLevelChange?.(forcedEffort.level);
+    }
+  }
 
   const baseSessionName = agentConfig?.name ?? type;
   session.setSessionName(
@@ -1234,9 +1257,18 @@ export async function resumeAgent(
   // rather than continuing on the old model.
   const forced = resolveForcedModel(modelRegistryFromRuntime(session.modelRuntime));
   if (typeof forced === "string") throw new Error(forced);
+  // Validate both policies before mutating the session. Use the effective model
+  // for clamping, and avoid setThinkingLevel, which persists a global pi default.
+  const forcedEffort = resolveForcedEffort(forced ?? session.model ?? session.agent?.state?.model);
+  if (forcedEffort.error) throw new Error(forcedEffort.error);
   if (forced) {
     session.agent.state.model = forced;
     session.sessionManager?.appendModelChange?.(forced.provider, forced.id);
+  }
+  if (forcedEffort.level !== undefined && session.agent?.state
+    && session.agent.state.thinkingLevel !== forcedEffort.level) {
+    session.agent.state.thinkingLevel = forcedEffort.level;
+    session.sessionManager?.appendThinkingLevelChange?.(forcedEffort.level);
   }
   // Boundary for the history fallback: the session already holds prior turns,
   // so only assistant text produced by THIS resume prompt counts as its output

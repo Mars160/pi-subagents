@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getAvailableTypes, registerAgents, setFallbackSubagent } from "../src/agent-types.js";
 import { loadCustomAgents } from "../src/custom-agents.js";
+import { setDefaultEffort, setForceDefaultEffort } from "../src/effort-policy.js";
 import { setDefaultModel, setForceDefaultModel } from "../src/model-policy.js";
 import { setScopeModelsEnabled } from "../src/model-scope.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager, setMaxSubagentDepth } from "../src/nested-tools.js";
@@ -618,6 +619,42 @@ describe("nested spawns honour defaultModel / forceDefaultModel", () => {
 
     expect(result.isError).toBe(true);
     expect(result.content[0]?.text ?? "").toContain("forceDefaultModel is enabled but defaultModel is not set");
+    expect(spawnAndWait).not.toHaveBeenCalled();
+  });
+});
+
+// The nested Agent tool is its own registration-time description surface, and
+// the nested path must fail the same way the top-level tool does when force is
+// on without a default.
+describe("nested Agent tool honours the effort policy", () => {
+  afterEach(() => {
+    setDefaultEffort(undefined);
+    setForceDefaultEffort(false);
+  });
+
+  it("appends the configured default to the tool description", () => {
+    setDefaultEffort("low");
+    const [agent] = tools();
+    expect(agent.description).toContain(
+      'Subagents use thinking level "low" when neither the call nor an agent file sets one.',
+    );
+  });
+
+  it("states a forced policy ignores caller and frontmatter", () => {
+    setDefaultEffort("high");
+    setForceDefaultEffort(true);
+    const [agent] = tools();
+    expect(agent.description).toContain('Reasoning effort is forced to "high" for every subagent');
+  });
+
+  it("fails closed under force with no default configured", async () => {
+    setForceDefaultEffort(true);
+    const [agent] = tools();
+
+    const result = await execute(agent, { subagent_type: "reviewer", description: "d", prompt: "p" });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text ?? "").toContain("forceDefaultEffort is enabled but defaultEffort is not set");
     expect(spawnAndWait).not.toHaveBeenCalled();
   });
 });

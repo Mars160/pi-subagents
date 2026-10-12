@@ -24,6 +24,14 @@ import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, get
 import { inChildSessionContext } from "./child-context.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
+import {
+  effortPolicyGuideline,
+  getDefaultEffort,
+  isEffortLevel,
+  isForceDefaultEffort,
+  setDefaultEffort,
+  setForceDefaultEffort,
+} from "./effort-policy.js";
 import type { GenerationStats } from "./generation.js";
 import { GroupJoinManager } from "./group-join.js";
 import { isolationParam, resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
@@ -1444,6 +1452,8 @@ export default function (pi: ExtensionAPI) {
       setSubagentInstructionsFile,
       setDefaultModel,
       setForceDefaultModel,
+      setDefaultEffort,
+      setForceDefaultEffort,
       setReportUsage,
       setShowCost,
       setShowModel,
@@ -1587,15 +1597,24 @@ Terse command-style prompts produce shallow, generic work.
     return undefined;
   };
 
+  // Injected into every Agent description (full/compact/custom) and the
+  // SubagentWorkflow description at registration, so the model is told the
+  // project's effort policy before it picks a level. Generated once — a change
+  // needs a new pi session, like the rest of the tool spec. Empty when nothing
+  // is configured, so an unconfigured project pays no tokens.
+  const effortGuideline = effortPolicyGuideline();
+  const appendEffortGuideline = (text: string): string =>
+    effortGuideline ? `${text}\n\n${effortGuideline}` : text;
+
   const agentToolDescription = (() => {
     const mode = getToolDescriptionMode();
-    if (mode === "compact") return compactAgentToolDescription;
+    if (mode === "compact") return appendEffortGuideline(compactAgentToolDescription);
     if (mode === "custom") {
       const custom = loadCustomToolDescription();
-      if (custom) return custom;
+      if (custom) return appendEffortGuideline(custom);
       console.warn('[pi-subagents] toolDescriptionMode is "custom" but no agent-tool-description.md found — using "full"');
     }
-    return fullAgentToolDescription;
+    return appendEffortGuideline(fullAgentToolDescription);
   })();
 
   // Held rather than registered inline: the mention clone reuses this exact
@@ -1636,7 +1655,7 @@ Terse command-style prompts produce shallow, generic work.
       ),
       thinking: Type.Optional(
         Type.String({
-          description: `Thinking level: ${THINKING_LEVELS.join(", ")}. Overrides agent default.`,
+          description: `Thinking level: ${THINKING_LEVELS.join(", ")}. Overrides agent default.${effortGuideline ? ` ${effortGuideline}` : ""}`,
         }),
       ),
       max_turns: Type.Optional(
@@ -1831,6 +1850,9 @@ Terse command-style prompts produce shallow, generic work.
         worktreeAllowed: isWorktreeIsolationEnabled(),
         defaultRunInBackground: getBackgroundByDefault(),
       });
+      // `forceDefaultEffort` with no `defaultEffort` is a configuration error:
+      // fail here rather than spawning at an arbitrary level.
+      if (resolvedConfig.effortError) return textResult(resolvedConfig.effortError);
 
       // Model precedence lives in model-policy.ts: forceDefaultModel > the
       // agent file vs the caller (frontmatter wins here) > defaultModel > the
@@ -2433,7 +2455,7 @@ Terse command-style prompts produce shallow, generic work.
   const workflowTool = defineTool({
     name: SUBAGENT_TOOL_NAMES.WORKFLOW,
     label: "SubagentWorkflow",
-    description: renderToolDescriptionTemplate(fullWorkflowToolDescription),
+    description: appendEffortGuideline(renderToolDescriptionTemplate(fullWorkflowToolDescription)),
     promptSnippet: "Run a deterministic script that orchestrates many subagents",
     promptGuidelines: [
       "Use SubagentWorkflow when the number of agents depends on something discovered at runtime, when work flows through stages, or when findings should be independently verified. Use Agent for one delegated task or a handful you can name up front.",
@@ -3507,6 +3529,8 @@ Write the file using the write tool. Only write the file, nothing else.`;
       // "no default here" so the global one still applies after the merge.
       defaultModel: getDefaultModel(),
       forceDefaultModel: isForceDefaultModel(),
+      defaultEffort: getDefaultEffort(),
+      forceDefaultEffort: isForceDefaultEffort(),
       reportUsage: isReportUsageEnabled(),
       showCost: isShowCostEnabled(),
       showModel: isShowModelEnabled(),
@@ -3538,7 +3562,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
    * validation (and with an empty value allowed — it is how a project clears a
    * global default).
    */
-  const TEXT_INPUT_IDS = new Set(["defaultModel"]);
+  const TEXT_INPUT_IDS = new Set(["defaultModel", "defaultEffort"]);
   const isPromptedId = (id: string): boolean => NUMERIC_IDS.has(id) || TEXT_INPUT_IDS.has(id);
 
   async function showSettings(ctx: ExtensionCommandContext) {
@@ -3636,6 +3660,22 @@ Write the file using the write tool. Only write the file, nothing else.`;
           description:
             "Make Default model outrank every other choice — the Agent call's model, an agent file's frontmatter, workflow scripts, the RPC payload and the parent model. Requires Default model, or spawns fail with a configuration error. Applied to resumes too.",
           currentValue: isForceDefaultModel() ? "on" : "off",
+          values: ["on", "off"],
+        },
+        {
+          id: "defaultEffort",
+          label: "Default effort",
+          description:
+            "Thinking level for subagents that don't name one: minimal, low, medium, high, xhigh, max (Enter to type; empty clears a global default). Loses to the Agent call's thinking and an agent file's thinking: frontmatter; set Force default effort to make it win.",
+          currentValue: getDefaultEffort() || "(inherit parent)",
+          values: [getDefaultEffort() ?? ""],
+        },
+        {
+          id: "forceDefaultEffort",
+          label: "Force default effort",
+          description:
+            "Make Default effort outrank every other choice — the Agent call's thinking, an agent file's thinking: frontmatter and a workflow script's effort. Requires Default effort, or spawns fail with a configuration error. Applied to resumes too.",
+          currentValue: isForceDefaultEffort() ? "on" : "off",
           values: ["on", "off"],
         },
         {
@@ -3850,6 +3890,33 @@ Write the file using the write tool. Only write the file, nothing else.`;
           enabled
             ? "Force default model on — every subagent uses the Default model; set Default model first or spawns fail"
             : "Force default model off",
+        );
+      } else if (id === "defaultEffort") {
+        const trimmed = value.trim();
+        if (trimmed !== "" && !isEffortLevel(trimmed)) {
+          ctx.ui.notify(
+            `Unknown thinking level "${trimmed}" — use minimal, low, medium, high, xhigh or max.`,
+            "warning",
+          );
+        } else {
+          // "" is stored (not undefined): it is how a project clears a globally
+          // configured level, and the snapshot writes it back verbatim.
+          setDefaultEffort(trimmed);
+          notifyApplied(
+            ctx,
+            trimmed
+              ? `Default effort set to ${trimmed}${isForceDefaultEffort() ? " (forced)" : ""}`
+              : "Default effort cleared",
+          );
+        }
+      } else if (id === "forceDefaultEffort") {
+        const enabled = value === "on";
+        setForceDefaultEffort(enabled);
+        notifyApplied(
+          ctx,
+          enabled
+            ? "Force default effort on — every subagent uses Default effort; set Default effort first or spawns fail"
+            : "Force default effort off",
         );
       } else if (id === "scopeModels") {
         const enabled = value === "on";

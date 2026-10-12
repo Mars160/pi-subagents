@@ -6,6 +6,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { NO_FALLBACK } from "./agent-types.js";
+import { isEffortLevel } from "./effort-policy.js";
 import type { AgentMentionMode, JoinMode, ViewerMarkdownMode, WidgetMode } from "./types.js";
 
 export interface SubagentsSettings {
@@ -98,6 +99,36 @@ export interface SubagentsSettings {
    * there is no `resume` route around the setting.
    */
   forceDefaultModel?: boolean;
+  /**
+   * Project/global default thinking level for subagents that don't name one,
+   * one of `"minimal" | "low" | "medium" | "high" | "xhigh" | "max"`.
+   *
+   * It is a *fallback*, not an override: a caller's `thinking:` and an agent
+   * file's `thinking:` frontmatter both still win, and it sits above the
+   * inherited parent level. `forceDefaultEffort` is what makes it outrank them.
+   * Unknown spellings are dropped by the sanitizer, so a typo does not reach a
+   * session that would reject it.
+   *
+   * `""` is a real value: a project file clearing a globally configured
+   * default. Absent means "no default here", so the global one still applies
+   * after the merge.
+   */
+  defaultEffort?: string;
+  /**
+   * When true, `defaultEffort` outranks every other thinking level — the
+   * caller's `thinking` parameter, an agent file's `thinking:` frontmatter and a
+   * workflow script's `effort:` — so a project can pin subagent reasoning cost.
+   * Defaults to false.
+   *
+   * Requires `defaultEffort`: with the setting on and no level configured every
+   * spawn fails with a configuration error instead of quietly falling back.
+   *
+   * Resumes are covered too — a live session is switched onto the default
+   * before its next turn, and a persisted conversation reopened in a new pi
+   * session has it applied after the session file's own recorded level — so
+   * there is no `resume` route around the setting.
+   */
+  forceDefaultEffort?: boolean;
   /**
    * When true, the effective model of each subagent spawn is validated
    * against `enabledModels` from pi's settings — both global
@@ -387,6 +418,8 @@ export interface SettingsAppliers {
   setSubagentInstructionsFile: (v: string | undefined) => void;
   setDefaultModel: (v: string | undefined) => void;
   setForceDefaultModel: (b: boolean) => void;
+  setDefaultEffort: (v: string | undefined) => void;
+  setForceDefaultEffort: (b: boolean) => void;
   setReportUsage: (b: boolean) => void;
   setShowCost: (b: boolean) => void;
   setShowModel: (b: boolean) => void;
@@ -538,6 +571,15 @@ function sanitize(raw: unknown): SubagentsSettings {
   if (typeof r.forceDefaultModel === "boolean") {
     out.forceDefaultModel = r.forceDefaultModel;
   }
+  if (typeof r.defaultEffort === "string") {
+    // "" is the project's clear; a known level is the default. Anything else is
+    // dropped rather than written through to a session that would reject it.
+    const trimmed = r.defaultEffort.trim();
+    if (trimmed === "" || isEffortLevel(trimmed)) out.defaultEffort = trimmed;
+  }
+  if (typeof r.forceDefaultEffort === "boolean") {
+    out.forceDefaultEffort = r.forceDefaultEffort;
+  }
   return out;
 }
 
@@ -601,6 +643,8 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   }
   if (typeof s.defaultModel === "string") appliers.setDefaultModel(s.defaultModel);
   if (typeof s.forceDefaultModel === "boolean") appliers.setForceDefaultModel(s.forceDefaultModel);
+  if (typeof s.defaultEffort === "string") appliers.setDefaultEffort(s.defaultEffort);
+  if (typeof s.forceDefaultEffort === "boolean") appliers.setForceDefaultEffort(s.forceDefaultEffort);
   if (s.defaultJoinMode) appliers.setDefaultJoinMode(s.defaultJoinMode);
   if (typeof s.backgroundByDefault === "boolean") appliers.setBackgroundByDefault(s.backgroundByDefault);
   if (typeof s.schedulingEnabled === "boolean") appliers.setSchedulingEnabled(s.schedulingEnabled);

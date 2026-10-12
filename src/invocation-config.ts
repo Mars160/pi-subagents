@@ -1,4 +1,5 @@
 import { Type } from "@sinclair/typebox";
+import { resolveEffectiveEffort } from "./effort-policy.js";
 import { preferAgentFileModel } from "./model-policy.js";
 import type { AgentConfig, IsolationMode, JoinMode, ThinkingLevel } from "./types.js";
 
@@ -102,6 +103,12 @@ export function resolveAgentInvocationConfig(
   modelInput?: string;
   modelFromParams: boolean;
   thinking?: ThinkingLevel;
+  /**
+   * Set when `forceDefaultEffort` is on and no `defaultEffort` is configured.
+   * The level is undefined in that case, and the caller must fail the spawn
+   * with this message rather than run at an arbitrary level.
+   */
+  effortError?: string;
   maxTurns?: number;
   inheritContext: boolean;
   runInBackground: boolean;
@@ -128,9 +135,14 @@ export function resolveAgentInvocationConfig(
   // configured default and the forced override on top of it.
   const model = preferAgentFileModel(agentConfig?.model, params.model);
 
-  const overriddenThinking = agentConfig?.thinking != null && params.thinking != null
-    && agentConfig.thinking !== params.thinking
-    ? params.thinking as ThinkingLevel
+  // The winner of frontmatter-vs-caller, before effort-policy layers the
+  // configured default and the forced override on top of it.
+  const candidateThinking = (agentConfig?.thinking ?? params.thinking) as ThinkingLevel | undefined;
+  const effort = resolveEffectiveEffort(candidateThinking);
+
+  const requestedThinking = (params.thinking ?? agentConfig?.thinking) as ThinkingLevel | undefined;
+  const overriddenThinking = requestedThinking !== undefined && requestedThinking !== effort.level
+    ? requestedThinking
     : undefined;
   const overriddenModel = agentConfig?.model != null && params.model != null
     && agentConfig.model !== params.model
@@ -140,7 +152,8 @@ export function resolveAgentInvocationConfig(
   return {
     modelInput: model.input,
     modelFromParams: model.source === "params" && model.input !== undefined,
-    thinking: (agentConfig?.thinking ?? params.thinking) as ThinkingLevel | undefined,
+    thinking: effort.level,
+    ...(effort.error !== undefined ? { effortError: effort.error } : {}),
     maxTurns: agentConfig?.maxTurns ?? params.max_turns,
     inheritContext: agentConfig?.inheritContext ?? params.inherit_context ?? false,
     runInBackground: agentConfig?.runInBackground ?? params.run_in_background ?? opts?.defaultRunInBackground ?? false,

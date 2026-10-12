@@ -36,6 +36,7 @@ import { existsSync } from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentManager } from "../agent-manager.js";
 import { getAgentConfig, resolveSpawnType } from "../agent-types.js";
+import { isEffortLevel, resolveEffectiveEffort } from "../effort-policy.js";
 import { resolveEffectiveModel } from "../model-policy.js";
 import { checkModelScope } from "../model-scope.js";
 import type { AgentRecord, ThinkingLevel } from "../types.js";
@@ -236,6 +237,11 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
         ctx.ui.notify(scopeVerdict.message, "warning");
       }
 
+      // Keep the script's precedence over frontmatter, then apply the configured
+      // fallback or forced effort. A default must not override a frontmatter pin.
+      const effort = resolveEffectiveEffort((request.effort as ThinkingLevel | undefined) ?? config?.thinking);
+      if (effort.error) return { ok: false, error: effort.error };
+
       /**
        * The gate's verdict, set only if the hook below actually ran the command.
        * Its presence is what stops the runtime running the gate a second time,
@@ -305,11 +311,9 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
             // never queued behind it.
             ...(deps.workflowId !== undefined ? { workflowId: deps.workflowId } : {}),
             ...(model !== undefined ? { model } : {}),
-            // Validated worker-side against the same list pi accepts, so the
-            // cast asserts what the boundary has already checked. Left unset,
-            // the agent definition's `thinking` (then the parent's) still wins —
-            // same precedence as `model` above.
-            ...(request.effort !== undefined ? { thinkingLevel: request.effort as ThinkingLevel } : {}),
+            // The shared policy has already resolved the script/frontmatter
+            // winner and the configured default or forced level.
+            ...(effort.level !== undefined ? { thinkingLevel: effort.level } : {}),
             // Seeded with the REQUEST, not the outcome. The manager overwrites
             // the effective half at session creation; without a seed there is
             // nothing for it to compare against, so a level pi clamped would be
@@ -321,7 +325,12 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
             // therefore always got what it asked for. Seeding a `requestedModel`
             // would describe a precedence this path does not have.
             invocation: {
-              ...(request.effort !== undefined ? { thinking: request.effort as ThinkingLevel } : {}),
+              ...(effort.level !== undefined ? { thinking: effort.level } : {}),
+              // A forced defaultEffort replaced a level the script did name, so
+              // keep the ask for the surfaces ("thinking: high (asked max)").
+              ...(isEffortLevel(request.effort) && request.effort !== effort.level
+                ? { requestedThinking: request.effort }
+                : {}),
             },
             // Fires once the child's session exists, which is where the model
             // and the clamped thinking level first become knowable.

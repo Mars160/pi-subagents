@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { setDefaultEffort, setForceDefaultEffort } from "../src/effort-policy.js";
 import subagentsExtension from "../src/index.js";
 import { setWorktreeIsolationEnabled } from "../src/worktree.js";
 
@@ -83,6 +84,11 @@ describe("toolDescriptionMode", () => {
     // previous test left it. Reset it so each setup()'s settings decide, and
     // so the "default" assertions below really test the default.
     setWorktreeIsolationEnabled(true);
+    // applySettings only applies keys that are PRESENT, so a settings file
+    // without an effort key leaves the module singleton where the previous test
+    // left it. Reset it so each setup()'s settings decide.
+    setDefaultEffort(undefined);
+    setForceDefaultEffort(false);
     process.chdir(prevCwd);
     if (prevAgentDir == null) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
@@ -409,6 +415,48 @@ describe("toolDescriptionMode", () => {
       const tools = withAgent("narrow", "tools: read, grep");
       const desc: string = tools.get("Agent").description;
       expect(desc).toContain("- narrow: narrow agent. (Tools: read, grep)");
+    });
+  });
+
+  // The effort policy is appended to every Agent description mode and the
+  // SubagentWorkflow description at registration, so the orchestrator is told
+  // before it picks a level. Nothing else asserts this text.
+  describe("defaultEffort / forceDefaultEffort are injected into registration-time descriptions", () => {
+    const GUIDE = 'Subagents use thinking level "low" when neither the call nor an agent file sets one.';
+
+    it("appends the default guideline to the full Agent description and the thinking param", () => {
+      const tool = setup({ defaultEffort: "low" }).get("Agent");
+      expect(tool.description).toContain(GUIDE);
+      expect(tool.parameters?.properties?.thinking?.description).toContain(GUIDE);
+    });
+
+    it("appends it to the compact description too", () => {
+      const desc: string = setup({ defaultEffort: "low", toolDescriptionMode: "compact" }).get("Agent").description;
+      expect(desc).toContain(GUIDE);
+    });
+
+    it("appends it to a custom template", () => {
+      const tools = setup({ defaultEffort: "low", toolDescriptionMode: "custom" }, () => {
+        writeFileSync(join(tmpDir, ".pi", "agent-tool-description.md"), "CUSTOM ONLY");
+      });
+      const desc: string = tools.get("Agent").description;
+      expect(desc).toContain("CUSTOM ONLY");
+      expect(desc).toContain(GUIDE);
+    });
+
+    it("states a forced default ignores caller and frontmatter, in Agent and SubagentWorkflow", () => {
+      const tools = setup({ defaultEffort: "high", forceDefaultEffort: true });
+      const forced = 'Reasoning effort is forced to "high" for every subagent';
+      expect(tools.get("Agent").description).toContain(forced);
+      expect(tools.get("Agent").parameters?.properties?.thinking?.description).toContain(forced);
+      expect(tools.get("SubagentWorkflow").description).toContain(forced);
+    });
+
+    it("adds nothing when the policy is unconfigured", () => {
+      const tools = setup();
+      expect(tools.get("Agent").description).not.toContain('Subagents use thinking level "');
+      expect(tools.get("Agent").parameters?.properties?.thinking?.description).not.toContain("Reasoning effort");
+      expect(tools.get("SubagentWorkflow").description).not.toContain("Reasoning effort");
     });
   });
 });

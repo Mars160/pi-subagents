@@ -30,6 +30,7 @@ vi.mock("../src/worktree.js", () => ({
 import { AgentManager } from "../src/agent-manager.js";
 import { runAgent } from "../src/agent-runner.js";
 import { registerAgents } from "../src/agent-types.js";
+import { setDefaultEffort, setForceDefaultEffort } from "../src/effort-policy.js";
 import { setDefaultModel, setForceDefaultModel } from "../src/model-policy.js";
 import { createWorkflowHost } from "../src/workflow/host.js";
 import type { WorkflowSpawnRequest } from "../src/workflow/runtime.js";
@@ -291,5 +292,107 @@ describe("workflow agent() honours defaultModel / forceDefaultModel", () => {
 
     expect(result.ok).toBe(false);
     expect((result as { error?: string }).error).toContain("Model not found");
+  });
+});
+
+describe("workflow agent() honours defaultEffort / forceDefaultEffort", () => {
+  const model = { provider: "anthropic", id: "claude-haiku-4-5", name: "Haiku 4.5" };
+  const registry = {
+    find: (provider: string, id: string) => (provider === model.provider && id === model.id ? model : undefined),
+    getAll: () => [model],
+    getAvailable: () => [model],
+  };
+  let manager: AgentManager;
+
+  beforeEach(() => {
+    vi.mocked(runAgent).mockReset();
+    registerAgents(new Map());
+    manager = new AgentManager();
+  });
+
+  afterEach(() => {
+    setDefaultEffort(undefined);
+    setForceDefaultEffort(false);
+  });
+
+  const spawnedThinking = () => (vi.mocked(runAgent).mock.calls.at(-1)?.[3] as any)?.thinkingLevel;
+
+  function registerPinnedAgent(thinking: string) {
+    registerAgents(new Map([["general-purpose", {
+      name: "general-purpose", description: "d", systemPrompt: "s", thinking,
+      extensions: false, skills: false, promptMode: "replace", persistSession: false,
+    } as any]]));
+  }
+
+  it("applies the configured default when neither the script nor the agent file names one", async () => {
+    childSessionReports({ model });
+    setDefaultEffort("low");
+    const host = createWorkflowHost({ pi, ctx: ctx({ modelRegistry: registry }), manager });
+
+    const result = await host.spawnAgent(spawnRequest());
+
+    expect(result.ok).toBe(true);
+    expect(spawnedThinking()).toBe("low");
+  });
+
+  it("does not let the default override the agent file's frontmatter", async () => {
+    childSessionReports({ model });
+    registerPinnedAgent("high");
+    setDefaultEffort("low");
+    const host = createWorkflowHost({ pi, ctx: ctx({ modelRegistry: registry }), manager });
+
+    await host.spawnAgent(spawnRequest());
+
+    expect(spawnedThinking()).toBe("high");
+  });
+
+  it("still lets the script's effort outrank the configured default", async () => {
+    childSessionReports({ model });
+    setDefaultEffort("low");
+    const host = createWorkflowHost({ pi, ctx: ctx({ modelRegistry: registry }), manager });
+
+    await host.spawnAgent(spawnRequest({ effort: "max" }));
+
+    expect(spawnedThinking()).toBe("max");
+  });
+
+  it("force overrides both the script's effort and the frontmatter pin", async () => {
+    childSessionReports({ model, thinkingLevel: "low" });
+    registerPinnedAgent("high");
+    setDefaultEffort("low");
+    setForceDefaultEffort(true);
+    const host = createWorkflowHost({ pi, ctx: ctx({ modelRegistry: registry }), manager });
+    const reported: Record<string, unknown>[] = [];
+
+    await host.spawnAgent(spawnRequest({ effort: "max", onResolved: configCollector(reported) }));
+
+    expect(spawnedThinking()).toBe("low");
+    // The ask is kept for the display surfaces ("thinking: low (asked max)").
+    expect(reported.at(-1)?.requestedThinking).toBe("max");
+  });
+
+  it("records no requestedThinking for an invalid ask the worker would have rejected", async () => {
+    childSessionReports({ model, thinkingLevel: "low" });
+    setDefaultEffort("low");
+    setForceDefaultEffort(true);
+    const host = createWorkflowHost({ pi, ctx: ctx({ modelRegistry: registry }), manager });
+    const reported: Record<string, unknown>[] = [];
+
+    // The worker skips validation under force, so an arbitrary string arrives.
+    await host.spawnAgent(spawnRequest({ effort: "ultra", onResolved: configCollector(reported) }));
+
+    expect(spawnedThinking()).toBe("low");
+    expect(reported.at(-1)?.requestedThinking).toBeUndefined();
+  });
+
+  it("fails this agent, not the run, under force with no default configured", async () => {
+    setForceDefaultEffort(true);
+    const host = createWorkflowHost({ pi, ctx: ctx({ modelRegistry: registry }), manager });
+
+    const result = await host.spawnAgent(spawnRequest());
+
+    expect(result.ok).toBe(false);
+    expect((result as { error?: string }).error).toContain("forceDefaultEffort is enabled but defaultEffort is not set");
+    expect(runAgent).not.toHaveBeenCalled();
   });
 });

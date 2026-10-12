@@ -16,6 +16,7 @@ import {
   resolveTypeIn,
 } from "./agent-types.js";
 import { loadCustomAgents } from "./custom-agents.js";
+import { effortPolicyGuideline } from "./effort-policy.js";
 import { isolationParam, resolveAgentInvocationConfig } from "./invocation-config.js";
 import { preferAgentFileModel, resolveEffectiveModel } from "./model-policy.js";
 import { checkModelScope } from "./model-scope.js";
@@ -157,12 +158,14 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
     return getAvailableTypesIn(registry).filter(name => allowed === undefined || allowed.has(name));
   };
 
+  const effortGuideline = effortPolicyGuideline();
   const agentTool = defineTool({
     name: NESTED_TOOL_NAMES[0],
     label: "Agent",
     description:
       "Launch a child-safe nested subagent for bounded delegated work. " +
-      "Only use agent types allowed by this parent agent; nesting is depth-limited.",
+      "Only use agent types allowed by this parent agent; nesting is depth-limited." +
+      (effortGuideline ? ` ${effortGuideline}` : ""),
     parameters: Type.Object({
       prompt: Type.String({ description: "Self-contained task for the nested agent." }),
       description: Type.String({ description: "Short 3-5 word task description." }),
@@ -228,6 +231,8 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         worktreeAllowed: isWorktreeIsolationEnabled(),
         defaultRunInBackground: false,
       });
+      // `forceDefaultEffort` with no `defaultEffort` is a configuration error.
+      if (invocation.effortError) return textResult(invocation.effortError, true);
       // Model precedence is shared with the Agent tool (model-policy.ts), so a
       // nested spawn cannot escape `forceDefaultModel` or skip `defaultModel`.
       const modelSelection = resolveEffectiveModel({

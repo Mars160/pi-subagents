@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
+import { setForceDefaultEffort } from "../src/effort-policy.js";
 import type { WorkflowJournalEntry } from "../src/workflow/journal.js";
 import { buildPhaseGroups, type WorkflowAgentEntry, type WorkflowEntry } from "../src/workflow/progress.js";
 import {
@@ -124,6 +125,60 @@ describe("script globals", () => {
     expect(result.error).toContain("agent() opts.effort must be one of");
     // Rejected at the call, so nothing was spawned at the wrong depth.
     expect(calls).toHaveLength(0);
+  });
+
+  // Under force the worker must not validate or reject an effort that will never
+  // reach a session — doing so would fail a call whose value is ignored anyway.
+  // A forced level is chosen host-side, so the worker only keeps a valid enum as
+  // display metadata and discards everything else (including "" and numbers).
+  describe("with forceDefaultEffort on", () => {
+    afterEach(() => setForceDefaultEffort(false));
+
+    for (const [label, value] of [
+      ["an unknown string", '"ultra"'],
+      ["the empty string", '""'],
+      ["a number", "42"],
+    ] as const) {
+      it(`ignores ${label} effort instead of failing the call`, async () => {
+        setForceDefaultEffort(true);
+        const { host, calls } = stubHost();
+        const result = await run(`await agent("a", { effort: ${value} });\nreturn null;`, { host });
+
+        expect(result.status, JSON.stringify(result)).toBe("completed");
+        expect(calls[0].effort).toBeUndefined();
+      });
+    }
+
+    it("keeps a valid effort as display metadata", async () => {
+      setForceDefaultEffort(true);
+      const { host, calls } = stubHost();
+      await run('await agent("a", { effort: "xhigh" });\nreturn null;', { host });
+
+      expect(calls[0].effort).toBe("xhigh");
+    });
+
+    it("tolerates effort alongside resume, whose mutual exclusion no longer applies", async () => {
+      setForceDefaultEffort(true);
+      const host = {
+        async spawnAgent() { return { ok: true, text: "first" }; },
+        async resumeAgent() { return { ok: true, text: "second" }; },
+        abortAgent() {},
+      };
+      const result = await run(
+        'await agent("a", { label: "L" });\nreturn await agent("a", { resume: "L", effort: "high" });\n',
+        { host },
+      );
+
+      expect(result.status, JSON.stringify(result)).toBe("completed");
+    });
+
+    it("still rejects effort alongside resume when force is off", async () => {
+      const { host } = stubHost();
+      const result = await run('await agent("a", { resume: "L", effort: "high" });\nreturn null;', { host });
+
+      expect(result.status).toBe("failed");
+      expect(result.error).toContain("opts.resume and opts.effort are mutually exclusive");
+    });
   });
 
   it("passes args through verbatim and exposes meta to the script", async () => {
