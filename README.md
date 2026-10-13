@@ -122,11 +122,11 @@ The extension renders a persistent widget above the editor showing active agents
 └─ 2 queued
 ```
 
-Agent rows also show the effective **`thinking: high`** level (including `off`) and measured **`42.1 tok/s`** generation throughput. Thinking is independent of the `showModel` toggle. Generation throughput appears in the widget (running and finished), FleetView, conversation viewer and inline Agent results once a successful assistant message has completed.
+Agent rows also show the effective **`thinking: high`** level (including `off`) and measured **`42.1 tok/s`** output throughput per model request. Thinking is independent of the `showModel` toggle. Request throughput appears in the widget (running and finished), FleetView, conversation viewer and inline Agent results once a successful assistant message has completed.
 
-**TPS measurement:** provider-reported output tokens divided by the sum of client-observed generation intervals, from the first non-empty text, thinking or tool-call-argument delta to the end of each successful assistant message. This excludes time-to-first-token, tool execution, queueing, retry backoff and failed/aborted messages; input/cache tokens and nested agents' usage are never counted. It is a duration-weighted conversation average across turns and resumes, refreshed at message completion and retained while tools run, not an instantaneous per-delta rate. Missing usage or timing produces no TPS field rather than a fabricated zero.
+**TPS measurement:** cumulative provider-reported output tokens divided by cumulative client-observed model request time. Timing starts immediately before invoking the model stream function and ends at each successful assistant message's completion, including time-to-first-token, hidden reasoning and stream finalization. Tool execution, queueing, between-request retry backoff and failed/aborted messages are excluded; retries inside the provider's stream function remain part of that request's time. Input/cache tokens and nested agents' usage are never counted. The rate is a duration-weighted conversation average across turns and resumes, refreshed at message completion and retained while tools run, not an instantaneous per-delta rate. Successful responses need not expose streaming deltas. Missing usage or request timing produces no TPS field rather than a fabricated zero.
 
-This is **observed streaming throughput**, not server-side decoder telemetry: network buffering and stream-finalization latency can affect it. Provider output usage may include hidden reasoning tokens even when reasoning deltas are not exposed; those providers cannot supply an exact reasoning-inclusive generation rate through this API.
+This is **effective request throughput**, not server-side decoder telemetry. It includes network latency and provider-side waiting, so it measures output delivered per second of model request time rather than pure token decoding speed.
 
 The token field is annotated with two optional signals inside parens:
 - **`NN%`** — context-window utilization (color-coded: <70% dim, 70–85% warning, ≥85% error). Omitted when the model has no declared `contextWindow`, or briefly right after compaction.
@@ -735,7 +735,7 @@ Toggle via `/agents → Settings → Show model`; applied live.
 | `${round}` | Formatted turn counter, e.g. `↻3≤20`, when available |
 | `${tool_uses_count}` | Tool-use count, including `0` |
 | `${total_token}` | Compact lifetime token count, e.g. `8.2k token` (excludes cache reads) |
-| `${tps}` | Measured generation rate, e.g. `42.1`, without the `tok/s` suffix |
+| `${tps}` | Cumulative output tokens per second of model request time, e.g. `42.1`, without the `tok/s` suffix |
 | `${time}` | Elapsed duration, e.g. `4.1s` |
 | `${cost}` | Estimated cost, e.g. `~$0.0042`, when priced |
 | `${status}` | Agent status, e.g. `running` or `completed` |
@@ -1031,7 +1031,7 @@ src/
   group-join.ts       # Group join manager: batched completion notifications with timeout
   status-note.ts      # Honest status note + salvaged partial output for non-normal outcomes
   usage.ts            # Token usage shapes, accumulators, session-stats readers
-  generation.ts       # Per-message streaming generation timing and local TPS totals
+  generation.ts       # Per-request model timing and local output TPS totals
 
   # Invocation surface
   invocation-config.ts # Shared tool-parameter schemas (isolation, join, thinking, ...)

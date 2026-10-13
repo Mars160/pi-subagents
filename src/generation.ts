@@ -1,4 +1,4 @@
-/** Client-observed generation timing, separate from task/tool wall time. */
+/** Client-observed model request timing, separate from task/tool wall time. */
 import type { AgentSession, AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 
 export interface GenerationStats {
@@ -7,31 +7,33 @@ export interface GenerationStats {
 }
 
 /**
- * Measure each successful assistant stream from its first non-empty output
- * delta to message_end. Includes streamed thinking and tool-call arguments;
- * excludes time-to-first-token, tools, retries and failed/aborted messages.
+ * Measure each successful model request from streamFunction invocation to
+ * message_end, including time-to-first-token and hidden reasoning. Excludes
+ * tools, queueing, between-request retry backoff and failed/aborted messages.
+ * Retries inside the provider's stream function remain part of request time.
  * Token counts come from provider usage, never from character estimates.
  */
 export function subscribeGeneration(
-  session: Pick<AgentSession, "subscribe">,
+  session: Pick<AgentSession, "subscribe"> & { agent: Pick<AgentSession["agent"], "streamFunction"> },
   onGeneration: (stats: GenerationStats) => void,
   now: () => number = () => performance.now(),
 ): () => void {
-  let firstDeltaAt: number | undefined;
-  return session.subscribe((event: AgentSessionEvent) => {
-    if (event.type === "message_start" && event.message.role === "assistant") {
-      firstDeltaAt = undefined;
+  let requestStartedAt: number | undefined;
+  const originalStream = session.agent.streamFunction;
+  const timedStream: typeof originalStream = (...args) => {
+    requestStartedAt = now();
+    try {
+      return originalStream.apply(session.agent, args);
+    } catch (error) {
+      requestStartedAt = undefined;
+      throw error;
     }
-    if (event.type === "message_update") {
-      const update = event.assistantMessageEvent;
-      if ((update.type === "text_delta" || update.type === "thinking_delta" || update.type === "toolcall_delta")
-        && update.delta.length > 0) {
-        firstDeltaAt ??= now();
-      }
-    }
+  };
+  session.agent.streamFunction = timedStream;
+  const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
     if (event.type !== "message_end" || event.message.role !== "assistant") return;
-    const started = firstDeltaAt;
-    firstDeltaAt = undefined;
+    const started = requestStartedAt;
+    requestStartedAt = undefined;
     if (started === undefined || event.message.stopReason === "error" || event.message.stopReason === "aborted") return;
     const outputTokens = event.message.usage?.output;
     const durationMs = now() - started;
@@ -39,6 +41,11 @@ export function subscribeGeneration(
       onGeneration({ outputTokens, durationMs });
     }
   });
+  return () => {
+    unsubscribe();
+    if (session.agent.streamFunction === timedStream) session.agent.streamFunction = originalStream;
+    requestStartedAt = undefined;
+  };
 }
 
 /** Only local measured output is accumulated, not nested agents' billed usage. */

@@ -117,6 +117,16 @@ import { resumeAgent, runAgent } from "../src/agent-runner.js";
 import type { GenerationStats } from "../src/generation.js";
 import { formatGenerationTps } from "../src/ui/agent-widget.js";
 
+type StreamFn = AgentSession["agent"]["streamFunction"];
+const TEST_MODEL = {} as Parameters<StreamFn>[0];
+const TEST_CONTEXT = { messages: [] } as Parameters<StreamFn>[1];
+
+/** Start a stream request: `subscribeGeneration` measures from this call, not
+ *  from `message_start` or the first delta. */
+function startRequest(session: AgentSession) {
+  session.agent.streamFunction(TEST_MODEL, TEST_CONTEXT);
+}
+
 /** Prompt behaviour queued for each successive `session.prompt()` call. */
 type PromptScript = (session: AgentSession, emit: (event: AgentSessionEvent) => void) => void;
 
@@ -155,7 +165,7 @@ function createSession(): { session: AgentSession; emit: (event: AgentSessionEve
     getActiveToolNames: vi.fn(() => ["read"]),
     setActiveToolsByName: vi.fn(),
     getAllTools: vi.fn(() => []),
-    agent: {},
+    agent: { streamFunction: vi.fn<StreamFn>(() => ({}) as ReturnType<StreamFn>) },
     setSessionName: vi.fn(),
     bindExtensions: vi.fn(async () => {}),
     sessionManager: { getSessionFile: () => undefined },
@@ -184,8 +194,11 @@ function assistantMessage(stopReason: AssistantMessage["stopReason"], output: nu
 }
 
 /** Emit one assistant stream whose measured generation window is exactly
- *  `durationMs` (first non-empty delta at `from`, `message_end` at `from + durationMs`). */
+ *  `durationMs`, from the `streamFunction` request at `from` to `message_end`
+ *  at `from + durationMs`. The first output is deliberately delayed by
+ *  `ttftMs` (default 100) so the window must include time-to-first-token. */
 function emitStream(
+  session: AgentSession,
   emit: (event: AgentSessionEvent) => void,
   opts: {
     from: number;
@@ -193,12 +206,14 @@ function emitStream(
     output: number;
     stopReason?: AssistantMessage["stopReason"];
     deltaType?: "text_delta" | "thinking_delta" | "toolcall_delta";
+    ttftMs?: number;
   },
 ) {
   const message = assistantMessage(opts.stopReason ?? "stop", opts.output);
   clock = opts.from;
+  startRequest(session);
+  clock = opts.from + (opts.ttftMs ?? 100);
   emit({ type: "message_start", message });
-  clock = opts.from;
   emit({
     type: "message_update",
     message,
@@ -249,13 +264,16 @@ afterEach(async () => {
 // ─── runner wiring ───────────────────────────────────────────────────────
 
 describe("runAgent → onGeneration wiring", () => {
-  it("reports one measured generation per successful assistant stream, starting at the first non-empty delta", async () => {
+  it("reports one measured generation per successful assistant stream, from the request through message_end", async () => {
     const measured: GenerationStats[] = [];
-    promptScripts.push((_session, emit) => {
-      // First non-empty delta is the THINKING delta at t=500, not the text
-      // delta at t=1000 — the window must start at 500.
+    promptScripts.push((session, emit) => {
       const message = assistantMessage("stop", 120);
+      // The request opens the window at t=100; message_start only arrives at
+      // t=500, so the 400 ms TTFT must be counted, as must the tool-call gap
+      // inside the stream up to message_end at t=3000.
       clock = 100;
+      startRequest(session);
+      clock = 500;
       emit({ type: "message_start", message });
       clock = 500;
       emit({ type: "message_update", message, assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "hmm", partial: message } });
@@ -269,15 +287,17 @@ describe("runAgent → onGeneration wiring", () => {
 
     await runAgent(ctx, "Explore", "go", { pi, onGeneration: (stats) => measured.push(stats) });
 
-    expect(measured).toEqual([{ outputTokens: 120, durationMs: 2500 }]);
+    expect(measured).toEqual([{ outputTokens: 120, durationMs: 2900 }]);
   });
 
-  it("does not fabricate generation for a message that streamed no deltas", async () => {
+  it("measures a successful message that streamed no deltas", async () => {
     const measured: GenerationStats[] = [];
     const seenUsage: number[] = [];
-    promptScripts.push((_session, emit) => {
+    promptScripts.push((session, emit) => {
       const message = assistantMessage("stop", 100);
       clock = 0;
+      startRequest(session);
+      clock = 400;
       emit({ type: "message_start", message });
       clock = 1000;
       emit({ type: "message_end", message });
@@ -289,18 +309,18 @@ describe("runAgent → onGeneration wiring", () => {
       onAssistantUsage: (usage) => seenUsage.push(usage.output),
     });
 
-    expect(measured).toEqual([]);
-    // The usage callback is independent of the generation callback: a billed
-    // message with no streamed output still reports tokens.
+    // No deltas is no longer disqualifying: the request/message_end window is
+    // real even when the provider only streamed a final message.
+    expect(measured).toEqual([{ outputTokens: 100, durationMs: 1000 }]);
     expect(seenUsage).toEqual([100]);
   });
 
   it.each(["error", "aborted"] as const)("discards a %s stream while still reporting its usage", async (stopReason) => {
     const measured: GenerationStats[] = [];
     const seenUsage: number[] = [];
-    promptScripts.push((_session, emit) => {
-      emitStream(emit, { from: 0, durationMs: 2000, output: 100, stopReason });
-      emitStream(emit, { from: 10_000, durationMs: 1000, output: 30 });
+    promptScripts.push((session, emit) => {
+      emitStream(session, emit, { from: 0, durationMs: 2000, output: 100, stopReason });
+      emitStream(session, emit, { from: 10_000, durationMs: 1000, output: 30 });
     });
 
     await runAgent(ctx, "Explore", "go", {
@@ -321,15 +341,16 @@ describe("resumeAgent → onGeneration wiring", () => {
     const { session } = createSession();
     session.messages.push(assistantMessage("stop", 0));
     const measured: GenerationStats[] = [];
-    promptScripts.push((_session, emit) => {
-      emitStream(emit, { from: 0, durationMs: 1500, output: 80 });
+    promptScripts.push((session, emit) => {
+      emitStream(session, emit, { from: 0, durationMs: 1500, output: 80 });
     });
 
     await resumeAgent(session, "continue", { onGeneration: (stats) => measured.push(stats) });
 
     expect(measured).toEqual([{ outputTokens: 80, durationMs: 1500 }]);
-    // The runner tore its subscription down; a later resume must not reach it.
-    promptScripts.push((_session, emit) => emitStream(emit, { from: 0, durationMs: 500, output: 10 }));
+    // The runner tore its subscription down and restored `streamFunction`; a
+    // later resume must rewrap cleanly without reaching the old listener.
+    promptScripts.push((resumed, emit) => emitStream(resumed, emit, { from: 0, durationMs: 500, output: 10 }));
     await resumeAgent(session, "again");
     expect(measured).toHaveLength(1);
   });
@@ -346,7 +367,7 @@ describe("AgentManager generation accumulation", () => {
     manager = new AgentManager();
 
     // Run 1: 100 tokens over 2 s.
-    promptScripts.push((_session, emit) => emitStream(emit, { from: 0, durationMs: 2000, output: 100 }));
+    promptScripts.push((session, emit) => emitStream(session, emit, { from: 0, durationMs: 2000, output: 100 }));
     const id = spawnBackground();
     const record = manager.getRecord(id)!;
     await record.promise;
@@ -360,9 +381,9 @@ describe("AgentManager generation accumulation", () => {
     // time, so completedAt - startedAt is a genuinely different denominator.
     // `startedAt` is reset to the resume start; generation duration is NOT.
     wall = 1_100_000;
-    promptScripts.push((_session, emit) => {
+    promptScripts.push((session, emit) => {
       wall += 100_000;
-      emitStream(emit, { from: 0, durationMs: 1000, output: 300 });
+      emitStream(session, emit, { from: 0, durationMs: 1000, output: 300 });
     });
     await manager.resume(id, "again");
 
@@ -380,16 +401,16 @@ describe("AgentManager generation accumulation", () => {
   it("accumulates a detached background resume on top of the earlier runs", async () => {
     manager = new AgentManager();
 
-    promptScripts.push((_session, emit) => emitStream(emit, { from: 0, durationMs: 2000, output: 100 }));
+    promptScripts.push((session, emit) => emitStream(session, emit, { from: 0, durationMs: 2000, output: 100 }));
     const id = spawnBackground();
     const record = manager.getRecord(id)!;
     await record.promise;
 
-    promptScripts.push((_session, emit) => emitStream(emit, { from: 0, durationMs: 1000, output: 300 }));
+    promptScripts.push((session, emit) => emitStream(session, emit, { from: 0, durationMs: 1000, output: 300 }));
     await manager.resume(id, "again");
     expect(record.generation).toEqual({ outputTokens: 400, durationMs: 3000 });
 
-    promptScripts.push((_session, emit) => emitStream(emit, { from: 0, durationMs: 500, output: 50 }));
+    promptScripts.push((session, emit) => emitStream(session, emit, { from: 0, durationMs: 500, output: 50 }));
     const detached = await manager.resume(id, "background", undefined, { isBackground: true });
     expect(detached).toBe(record);
     await record.promise;
@@ -402,7 +423,7 @@ describe("AgentManager generation accumulation", () => {
   it.each(["error", "aborted"] as const)("leaves generation undefined for a %s run, even though usage was billed", async (stopReason) => {
     manager = new AgentManager();
 
-    promptScripts.push((_session, emit) => emitStream(emit, { from: 0, durationMs: 2000, output: 100, stopReason }));
+    promptScripts.push((session, emit) => emitStream(session, emit, { from: 0, durationMs: 2000, output: 100, stopReason }));
     const id = spawnBackground();
     const record = manager.getRecord(id)!;
     await record.promise;
@@ -417,7 +438,7 @@ describe("AgentManager generation accumulation", () => {
   it("does not fold a nested child's spend into the ancestor's generation", async () => {
     manager = new AgentManager();
 
-    promptScripts.push((_session, emit) => emitStream(emit, { from: 0, durationMs: 2000, output: 100 }));
+    promptScripts.push((session, emit) => emitStream(session, emit, { from: 0, durationMs: 2000, output: 100 }));
     const parentId = spawnBackground();
     const parent = manager.getRecord(parentId)!;
     await parent.promise;
@@ -427,7 +448,7 @@ describe("AgentManager generation accumulation", () => {
     // A nested child. `nested-tools.ts` books its spend onto every ancestor's
     // `lifetimeUsage` through exactly this option — reproduced here without
     // reaching through the nested tool surface.
-    promptScripts.push((_session, emit) => emitStream(emit, { from: 0, durationMs: 4000, output: 500 }));
+    promptScripts.push((session, emit) => emitStream(session, emit, { from: 0, durationMs: 4000, output: 500 }));
     const childId = manager.spawn(pi, ctx, "general-purpose", "child", {
       description: "child",
       isBackground: true,
