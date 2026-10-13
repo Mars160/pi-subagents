@@ -559,6 +559,22 @@ describe("FleetList overlay lifecycle", () => {
     expect(h.render().some(l => l.includes("the one"))).toBe(true); // and stays listed while viewed
   });
 
+  it("keeps a paused agent listed past the finished linger, marked as held", () => {
+    // The record is still live, so the row stays with it — well past the window
+    // that drops an agent that actually finished.
+    const held = makeRecord({ id: "held", description: "held one", status: "paused", completedAt: Date.now() - 60_000 });
+    const rows = harness([held]).render().map(plain);
+
+    expect(rows.some(l => l.includes("held one"))).toBe(true);
+    expect(rows.some(l => l.includes("‖ paused"))).toBe(true);
+  });
+
+  it("says nothing about holding on a running agent's row", () => {
+    const rows = harness([makeRecord({ id: "live", description: "the one" })]).render().map(plain);
+
+    expect(rows.some(l => l.includes("paused"))).toBe(false);
+  });
+
   it("lingers a finished agent in the list, then drops it after the window", () => {
     const recent = makeRecord({ id: "r", description: "recent done", status: "completed", completedAt: Date.now() });
     expect(harness([recent]).render().some(l => l.includes("recent done"))).toBe(true);

@@ -246,6 +246,8 @@ Spawns one subagent and resolves to its final text — or, with `schema`, to a v
 | `resume` | string | Continue the child that ran under that label instead of starting fresh |
 | `schema` | object | A JSON Schema with an object root. Resolves to the validated object instead of text |
 
+Workflow children do not use the top-level `Agent` tool's default 25-turn checkpoints. `pause_turns` and `pauseTurns` are not workflow `agent()` options: a script expects a settled final result, not a parent approval checkpoint. The inspector's `p` pauses the workflow's launch queue, not an individual child's model turns.
+
 Any other key is rejected **by name** at the call. Note that this checks option *keys*, not option *values* — an `agentType` that names no known agent falls back to `general-purpose` silently.
 
 Combination rules: `resume` cannot be combined with `agentType`, `model`, `effort`, `isolation`, `gate` or `schema` — a resumed child keeps the agent type, model, thinking level and tree it was started with, and its session predates the `StructuredOutput` tool. Project-level forced defaults are exceptions: `forceDefaultModel` switches a resumed child's active model, and `forceDefaultEffort` re-applies `defaultEffort`, adjusted to the actual model's supported levels, before its next turn. See [Persistent settings](../README.md#persistent-settings).

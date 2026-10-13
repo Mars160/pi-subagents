@@ -16,7 +16,7 @@ import { hasAgentBadge, renderAgentName } from "../agent-color.js";
 import { type AgentManager, isTopLevelAgent } from "../agent-manager.js";
 import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
 import { getLifetimeCost, getLifetimeTotal } from "../usage.js";
-import { type AgentActivity, buildInvocationTags, formatCost, formatGenerationTps, type Theme } from "./agent-widget.js";
+import { type AgentActivity, buildInvocationTags, formatCost, formatGenerationTps, isPausedStatus, type Theme } from "./agent-widget.js";
 import { ConversationViewer, VIEWPORT_HEIGHT_PCT } from "./conversation-viewer.js";
 
 /** Widget key for the below-editor fleet list. */
@@ -238,16 +238,17 @@ export class FleetList {
   /**
    * Agents shown in the list, ordered earliest-launched first so the ones you
    * started sooner sit at the top. Every row is openable (has a session), so Enter
-   * never dead-ends. Included: running/queued, plus the agent currently being
-   * viewed, plus recently-finished ones (they linger briefly before dropping out).
-   * Pending agents with no session yet are hidden until they start.
-   * (`listAgents()` is newest-first, so we re-sort.)
+   * never dead-ends. Included: running/queued, paused (not aged out), plus the
+   * agent currently being viewed, plus recently-finished ones (they linger
+   * briefly before dropping out). Pending agents with no session yet are hidden
+   * until they start. (`listAgents()` is newest-first, so we re-sort.)
    */
   private agentRecords(): AgentRecord[] {
     const now = Date.now();
     return this.manager.listAgents()
       .filter(a => isTopLevelAgent(a) && a.session && (
         a.status === "running" || a.status === "queued"
+        || isPausedStatus(a.status)
         || a.id === this.viewingAgentId
         || (a.completedAt != null && now - a.completedAt < FINISHED_LINGER_MS)
       ))
@@ -541,7 +542,10 @@ export class FleetList {
     // buildInvocationTags so a level pi clamped keeps its "(asked X)" note.
     const thinkingTag = buildInvocationTags(record.invocation).tags.find(tag => tag.startsWith("thinking: "));
     const tps = formatGenerationTps(record.generation);
-    const stats = [formatFleetElapsed(elapsedMs), formatFleetTokens(tokens), cost, thinkingTag, tps]
+    // The same `‖` the widget uses, in the stats group: the left side is what a
+    // narrow terminal truncates first.
+    const pauseMark = isPausedStatus(record.status) ? "‖ paused" : "";
+    const stats = [pauseMark, formatFleetElapsed(elapsedMs), formatFleetTokens(tokens), cost, thinkingTag, tps]
       .filter(Boolean)
       .join(" · ");
     const right = selected ? theme.fg("text", stats) : theme.fg("dim", stats);

@@ -2635,6 +2635,370 @@ describe("agent-runner turn limits", () => {
     await runWithTurns(3, { maxTurns: 10, onTurnEnd });
     expect(onTurnEnd.mock.calls.map(c => c[0])).toEqual([1, 2, 3]);
   });
+
+  it("counts turns already spent by earlier segments against the cap", async () => {
+    // A resumed agent keeps the budget it already spent: 2 earlier turns plus 3
+    // now is 5, not 3.
+    setGraceTurns(5);
+    const { session } = await runWithTurns(3, { maxTurns: 5, turnOffset: 2 });
+    expect(session.steer).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not steer while the lifetime count is under the cap", async () => {
+    const { session } = await runWithTurns(2, { maxTurns: 5, turnOffset: 2 });
+    expect(session.steer).not.toHaveBeenCalled();
+  });
+
+  it("aborts after the grace turns of the lifetime count", async () => {
+    setGraceTurns(2);
+    const { session, result } = await runWithTurns(4, { maxTurns: 3, turnOffset: 3 });
+    expect(session.steer).toHaveBeenCalledTimes(1);
+    expect(session.abort).toHaveBeenCalled();
+    expect(result.aborted).toBe(true);
+  });
+
+  it("still reports this segment's own turns to onTurnEnd when offset", async () => {
+    const onTurnEnd = vi.fn();
+    await runWithTurns(3, { maxTurns: 20, turnOffset: 7, onTurnEnd });
+    expect(onTurnEnd.mock.calls.map(c => c[0])).toEqual([1, 2, 3]);
+  });
+});
+
+/**
+ * Turn checkpoints and the runner's side of them. The mock session drives the
+ * SDK's control flow the way pi-agent-core does — turn_end, then the
+ * `shouldStopAfterTurn` hook, then `_runAgentPrompt`'s post-run continuation —
+ * so these assert what runAgent/resumeAgent DO with a pause rather than only
+ * that the hook was installed. `test/turn-checkpoint.test.ts` covers the hook
+ * itself; `test/pause-turns-e2e.test.ts` covers it against a real session.
+ */
+describe("agent-runner turn checkpoints", () => {
+  const prevMax = getDefaultMaxTurns();
+  const prevGrace = getGraceTurns();
+  afterEach(() => {
+    setDefaultMaxTurns(prevMax);
+    setGraceTurns(prevGrace);
+  });
+
+  /** A session with the agent hooks a checkpoint wraps, plus the SDK's own drain. */
+  function createCheckpointSession() {
+    const { session, listeners } = createSession("OK");
+    const agent = session.agent as any;
+    agent.shouldStopAfterTurn = undefined;
+    agent.continue = vi.fn(async () => {});
+    agent.hasQueuedMessages = vi.fn(() => false);
+    return { session, agent, listeners };
+  }
+
+  /** Drive `turns` turns like agent-loop.js, then drain like agent-session.js. */
+  function driveTurns(
+    session: any,
+    agent: any,
+    listeners: Array<(event: any) => void>,
+    turns: number,
+    opts: {
+      toolResultsPerTurn?: number;
+      /** 1-based turns that die on a provider error: turn_end fires, the hook does not. */
+      errorTurns?: number[];
+      queueFollowUp?: boolean;
+      lengthStop?: boolean;
+    } = {},
+  ) {
+    let turnsRun = 0;
+    let lastError = false;
+    const runTurns = async () => {
+      while (turnsRun < turns) {
+        turnsRun += 1;
+        const isError = (opts.errorTurns ?? []).includes(turnsRun);
+        // A "length" stop with tool calls: the calls are failed as truncated and
+        // become this turn's tool results, so the loop still reaches the hook.
+        const message = isError
+          ? { role: "assistant", stopReason: "error", content: [] }
+          : opts.lengthStop
+            ? { role: "assistant", stopReason: "length", content: [] }
+            : { role: "assistant", content: [{ type: "text", text: `turn ${turnsRun}` }] };
+        const toolResults = isError || (opts.toolResultsPerTurn ?? 1) === 0
+          ? []
+          : Array.from({ length: opts.toolResultsPerTurn ?? 1 }, () => ({ role: "toolResult" }));
+        session.messages.push(message, ...toolResults);
+        for (const l of [...listeners]) l({ type: "turn_end" });
+        lastError = isError;
+        if (isError) return;
+        const stop = await agent.shouldStopAfterTurn?.({ message, toolResults, context: {}, newMessages: [] });
+        if (stop) return;
+        // An abort lands after the in-flight turn: the next one never starts.
+        if (session.abort.mock.calls.length > 0) return;
+      }
+    };
+    agent.continue.mockImplementation(async () => {
+      lastError = false;
+      await runTurns();
+    });
+    session.prompt.mockImplementation(async () => {
+      lastError = false;
+      await runTurns();
+      // `_handlePostAgentRun`'s loop: a retryable error, or queued work, starts
+      // another loop run through agent.continue(). It consumes its saved message
+      // each call, so a no-op continue ends the loop instead of spinning.
+      let queued = opts.queueFollowUp === true;
+      while (lastError || queued) {
+        lastError = false;
+        queued = false;
+        await agent.continue();
+      }
+    });
+    return () => turnsRun;
+  }
+
+  it("stops at the checkpoint, reports it, and leaves the session resumable", async () => {
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+    const { session, agent, listeners } = createCheckpointSession();
+    const turnsRun = driveTurns(session, agent, listeners, 9, { queueFollowUp: true });
+    createAgentSession.mockResolvedValue({ session });
+
+    const result = await runAgent(ctx, "Explore", "go", { pi, pauseTurns: 2 });
+
+    expect(result.paused).toBe(true);
+    expect(result.aborted).toBe(false);
+    expect(result.steered).toBe(false);
+    // A pause is not a failure, and the SDK's own continuation did not run.
+    expect(result.failure).toBeUndefined();
+    expect(agent.continue).not.toHaveBeenCalled();
+    expect(turnsRun()).toBe(2);
+    // Stopped at a tool-results boundary, not mid-turn...
+    expect(session.messages.at(-1)?.role).toBe("toolResult");
+    // ...and nothing the checkpoint wrapped outlives the run.
+    expect(agent.shouldStopAfterTurn).toBeUndefined();
+  });
+
+  it("lets the SDK's post-run continuation through when the run never paused", async () => {
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+    const { session, agent, listeners } = createCheckpointSession();
+    driveTurns(session, agent, listeners, 1, { queueFollowUp: true });
+    createAgentSession.mockResolvedValue({ session });
+
+    const result = await runAgent(ctx, "Explore", "go", { pi, pauseTurns: 5 });
+
+    expect(result.paused).toBeUndefined();
+    expect(agent.continue).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips the structured-output retry when the run paused", async () => {
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+    const { session, agent, listeners } = createCheckpointSession();
+    driveTurns(session, agent, listeners, 4);
+    createAgentSession.mockResolvedValue({ session });
+
+    const result = await runAgent(ctx, "Explore", "go", { pi, pauseTurns: 1, structuredOutput: STRUCTURED });
+
+    expect(result.paused).toBe(true);
+    expect(result.structuredRetried).toBeUndefined();
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+    // Not "the agent did not report its answer": it was not asked to yet.
+    expect(result.failure).toBeUndefined();
+  });
+
+  it("still retries the structured-output prompt when the run did not pause", async () => {
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+    const { session, agent, listeners } = createCheckpointSession();
+    driveTurns(session, agent, listeners, 1);
+    createAgentSession.mockResolvedValue({ session });
+
+    const result = await runAgent(ctx, "Explore", "go", { pi, pauseTurns: 5, structuredOutput: STRUCTURED });
+
+    expect(result.structuredRetried).toBe(true);
+    expect(result.failure).toContain("StructuredOutput");
+  });
+
+  it("does not pause once max_turns has taken over", async () => {
+    // max_turns wins: an agent already told to wrap up must not also be stopped
+    // at a checkpoint, or the wrap-up never finishes.
+    setGraceTurns(5);
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+    const { session, agent, listeners } = createCheckpointSession();
+    const turnsRun = driveTurns(session, agent, listeners, 4);
+    createAgentSession.mockResolvedValue({ session });
+
+    const result = await runAgent(ctx, "Explore", "go", { pi, pauseTurns: 1, maxTurns: 1 });
+
+    expect(result.paused).toBeUndefined();
+    expect(result.steered).toBe(true);
+    expect(session.steer).toHaveBeenCalledTimes(1);
+    expect(turnsRun()).toBe(4);
+  });
+
+  it("counts provider-error turns toward the pause, like max_turns does", async () => {
+    // Turns 1-2 die on a provider error: turn_end fires and the runner counts
+    // them, but the checkpoint's hook never runs. The third counted turn is the
+    // interval, so the pause lands there rather than on the fifth turn.
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+    const { session, agent, listeners } = createCheckpointSession();
+    const turnsRun = driveTurns(session, agent, listeners, 4, { errorTurns: [1, 2] });
+    createAgentSession.mockResolvedValue({ session });
+
+    const result = await runAgent(ctx, "Explore", "go", { pi, pauseTurns: 3 });
+
+    expect(result.paused).toBe(true);
+    expect(turnsRun()).toBe(3);
+    expect(agent.continue).toHaveBeenCalledTimes(2); // the two retries, not a pause
+  });
+
+  it("does not report a truncated turn as a failure while paused", async () => {
+    // A silent max-token death is a failure for a FINISHED run (#144), but this
+    // run is not finished: the checkpoint stopped it and the caller resumes. The
+    // truncated tool results are in the transcript for the resumed segment.
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+    const { session, agent, listeners } = createCheckpointSession();
+    driveTurns(session, agent, listeners, 3, { lengthStop: true });
+    createAgentSession.mockResolvedValue({ session });
+
+    const result = await runAgent(ctx, "Explore", "go", { pi, pauseTurns: 1 });
+
+    expect(result.paused).toBe(true);
+    expect(result.failure).toBeUndefined();
+  });
+
+  it("still reports the truncated turn as a failure when the run is not paused", async () => {
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+    const { session, agent, listeners } = createCheckpointSession();
+    driveTurns(session, agent, listeners, 1, { lengthStop: true });
+    createAgentSession.mockResolvedValue({ session });
+
+    const result = await runAgent(ctx, "Explore", "go", { pi, pauseTurns: 5 });
+
+    expect(result.paused).toBeUndefined();
+    expect(result.failure).toBe("run hit the output token limit before producing any text");
+  });
+
+  it("treats pauseTurns 0 as no checkpoints", async () => {
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+    const { session, agent, listeners } = createCheckpointSession();
+    driveTurns(session, agent, listeners, 4);
+    createAgentSession.mockResolvedValue({ session });
+
+    const result = await runAgent(ctx, "Explore", "go", { pi, pauseTurns: 0 });
+
+    expect(result.paused).toBeUndefined();
+    expect(agent.shouldStopAfterTurn).toBeUndefined();
+  });
+
+  it("resumes with a fresh interval and its own turn counter", async () => {
+    setGraceTurns(5);
+    const { session, agent, listeners } = createCheckpointSession();
+    const turnsRun = driveTurns(session, agent, listeners, 3);
+    const onTurnEnd = vi.fn();
+
+    const result = await resumeAgent(session, "keep going", {
+      pauseTurns: 2,
+      maxTurns: 10,
+      turnOffset: 3,
+      onTurnEnd,
+    });
+
+    // The interval is the segment's own: the 3 turns spent earlier do not count
+    // against it, so the pause lands on this segment's 2nd turn (lifetime 5th).
+    expect(result.paused).toBe(true);
+    expect(turnsRun()).toBe(2);
+    expect(onTurnEnd.mock.calls.map(c => c[0])).toEqual([1, 2]);
+    // The text is this segment's own, and the run is not reported as a failure.
+    expect(result.text).toBe("turn 2");
+    expect(result.failure).toBeUndefined();
+    expect(result.steered).toBeUndefined();
+    expect(session.steer).not.toHaveBeenCalled();
+    expect(agent.shouldStopAfterTurn).toBeUndefined();
+  });
+
+  it("does not pause a resume whose lifetime count already reached the cap", async () => {
+    // Same precedence as runAgent, against the cumulative count: 2 turns spent
+    // earlier + this one reaches max_turns, so the wrap-up wins over the pause.
+    setGraceTurns(5);
+    const { session, agent, listeners } = createCheckpointSession();
+    const turnsRun = driveTurns(session, agent, listeners, 3);
+
+    const result = await resumeAgent(session, "go", { pauseTurns: 1, maxTurns: 3, turnOffset: 2 });
+
+    expect(result.paused).toBeUndefined();
+    expect(result.steered).toBe(true);
+    expect(session.steer).toHaveBeenCalledTimes(1);
+    expect(turnsRun()).toBe(3);
+  });
+
+  it("aborts immediately when the lifetime budget is already past max_turns + grace", async () => {
+    // 5 turns spent earlier, max_turns 3 + 1 grace: the wrap-up is issued before
+    // the prompt and the very first turn aborts, rather than the run spending a
+    // turn latching the soft limit first.
+    setGraceTurns(1);
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+    const { session, agent, listeners } = createCheckpointSession();
+    const turnsRun = driveTurns(session, agent, listeners, 4);
+    createAgentSession.mockResolvedValue({ session });
+
+    const result = await runAgent(ctx, "Explore", "go", { pi, maxTurns: 3, turnOffset: 5 });
+
+    expect(session.steer).toHaveBeenCalledTimes(1);
+    expect(session.steer.mock.invocationCallOrder[0]).toBeLessThan(
+      session.prompt.mock.invocationCallOrder[0],
+    );
+    expect(result.aborted).toBe(true);
+    expect(turnsRun()).toBe(1);
+  });
+
+  it("pauses a resumed segment without a cap or a caller counter", async () => {
+    // The pause reads the runner's own counter, so the subscription has to exist
+    // whenever a checkpoint is installed — not only when maxTurns or onTurnEnd
+    // asked for turn events.
+    const { session, agent, listeners } = createCheckpointSession();
+    const turnsRun = driveTurns(session, agent, listeners, 5);
+
+    const result = await resumeAgent(session, "keep going", { pauseTurns: 2 });
+
+    expect(result.paused).toBe(true);
+    expect(turnsRun()).toBe(2);
+    expect(agent.shouldStopAfterTurn).toBeUndefined();
+  });
+
+  it("wraps up before the prompt when the budget is already spent", async () => {
+    // Without the up-front latch, the first turn_end could only set the soft
+    // limit, so the abort branch would stay unreachable for a whole extra turn.
+    setGraceTurns(1);
+    const { session, agent, listeners } = createCheckpointSession();
+    const turnsRun = driveTurns(session, agent, listeners, 4);
+
+    const result = await resumeAgent(session, "go", { maxTurns: 2, turnOffset: 5 });
+
+    expect(session.steer).toHaveBeenCalledTimes(1);
+    expect(session.steer.mock.invocationCallOrder[0]).toBeLessThan(
+      session.prompt.mock.invocationCallOrder[0],
+    );
+    // 5 + 1 >= 2 + 1 grace: the very first turn aborts.
+    expect(session.abort).toHaveBeenCalled();
+    expect(result.aborted).toBe(true);
+    expect(result.steered).toBe(true);
+    expect(turnsRun()).toBe(1);
+  });
+
+  it("hard-aborts a resumed segment once the lifetime grace is used up", async () => {
+    setGraceTurns(1);
+    const { session, agent, listeners } = createCheckpointSession();
+    const turnsRun = driveTurns(session, agent, listeners, 4);
+
+    const result = await resumeAgent(session, "go", { maxTurns: 3, turnOffset: 2 });
+
+    // Turn 1 reaches max_turns (2 + 1) and steers; turn 2 reaches it plus the
+    // grace turn and aborts, so the run stops there.
+    expect(session.steer).toHaveBeenCalledTimes(1);
+    expect(session.abort).toHaveBeenCalled();
+    expect(result.aborted).toBe(true);
+    expect(result.steered).toBe(true);
+    expect(turnsRun()).toBe(2);
+  });
+
+  it("reports nothing extra for a resume that just runs to completion", async () => {
+    const { session } = createSession("DONE");
+    const result = await resumeAgent(session, "go");
+
+    expect(result).toEqual({ text: "DONE", failure: undefined });
+  });
 });
 
 // A parent Esc / interrupt reaches the child through options.signal. The only

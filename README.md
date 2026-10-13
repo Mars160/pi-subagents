@@ -23,6 +23,7 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 - **Scripted workflows** — a `SubagentWorkflow` tool that runs a deterministic JavaScript script orchestrating many subagents: `agent()`, `parallel()`, `pipeline()`, `phase()`, `log()` and `args`, with a pure-literal `meta` block declaring the phases. `pipeline()` has no barrier between stages, so one item can be in a later stage while another is still in the first — unlike `parallel()`, which idles every fast agent until the slowest finishes. Runs in the background with a live card, inspectable via `/agents → Workflows` or by selecting the run in FleetView. `agent()` also takes `gate: "npm test"` to verify a child by running a command (inside its worktree, when isolated) rather than asking another model, and `resume: "<label>"` to continue a child instead of re-paying its context. Scripts run in a `node:vm` sandbox on a worker thread where `Date.now()`, `Math.random()` and `eval` throw. On by default, but it stands down for company: if another extension already provides a `Workflow` or `SubagentWorkflow` tool, this one warns and disables itself for the session rather than offering the model two orchestrators. Pin it either way with `"workflowsEnabled"` in `subagents.json` or `/agents → Settings → Workflows`. A script written for Claude Code's `Workflow` tool runs here unchanged: same globals, `schema` returns a validated object exactly as it does there, `budget` is present and always reports no token target (pi has no such directive) so its `budget.total`-guarded patterns still take the branch they were written for, and nested `workflow()` composes saved workflows one level deep. **[Full guide](https://github.com/tintinweb/pi-subagents/blob/master/docs/workflows.md)**
 - **Mid-run steering** — inject messages into running agents to redirect their work without restarting
 - **Session resume** — pick up where an agent left off, preserving full conversation context. Resumes detached by default and notifies you on completion, just like a fresh spawn; pass `run_in_background: false` to block and get the result inline
+- **Turn checkpoints** — top-level `Agent` calls pause after every 25 turns by default, finishing the current tool batch before returning control to the parent. Review partial progress, then resume the same session with a fresh interval; set `pause_turns: 0` to disable
 - **Graceful turn limits** — agents get a "wrap up" warning before hard abort, producing clean partial results instead of cut-off output
 - **Case-insensitive agent types** — `"explore"`, `"Explore"`, `"EXPLORE"` all work. A type that doesn't resolve to exactly one *enabled* agent — unknown, disabled, or ambiguous between two agents differing only by case — falls back to general-purpose with a note, or is refused outright under [`fallbackSubagent: none`](#persistent-settings)
 - **Default and forced reasoning effort** — configure `defaultEffort` for subagents that do not specify a thinking level, or enable `forceDefaultEffort` to override caller parameters, agent frontmatter and workflow effort, including resumed sessions
@@ -33,7 +34,7 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 - **Skill preloading** — inject named skills into agent system prompts, discovered from `.pi/skills/`, `.agents/skills/`, and global locations (Pi-standard `<name>/SKILL.md` directory layout supported)
 - **Tool denylist** — block specific tools via `disallowed_tools` frontmatter
 - **Styled completion notifications** — background agent results render as themed, compact notification boxes (icon, stats, result preview) instead of raw XML. Expandable to show full output. Group completions render each agent individually
-- **Event bus** — lifecycle events (`subagents:created`, `started`, `completed`, `failed`, `steered`, `compacted`) emitted via `pi.events`, enabling other extensions to react to sub-agent activity
+- **Event bus** — lifecycle events (`subagents:created`, `started`, `paused`, `completed`, `failed`, `steered`, `compacted`) emitted via `pi.events`, enabling other extensions to react to sub-agent activity
 - **Cross-extension RPC** — other pi extensions can spawn, stop, and join subagents via the `pi.events` event bus (`subagents:rpc:ping`, `subagents:rpc:spawn`, `subagents:rpc:stop`, `subagents:rpc:consume`). Standardized reply envelopes with protocol versioning. Emits `subagents:ready` on session start. **[Full reference](https://github.com/tintinweb/pi-subagents/blob/master/docs/rpc.md)**
 - **Schedule subagents** — pass `schedule` to the `Agent` tool to fire on cron / interval / one-shot. Session-scoped jobs with PID-locked persistence; results land via the same `subagent-notification` followUp path as manual background completions; manage via `/agents → Scheduled jobs`
 - **Model scope enforcement** — opt-in validation that subagent model choices stay within your pi `enabledModels` allowlist (sourced from `/scoped-models`, with both global and project-local pi settings honored). Caller-supplied out-of-scope → hard error to orchestrator; frontmatter-pinned out-of-scope → warning + runs anyway (frontmatter authoritative). Toggle via `/agents → Settings → Scope models`
@@ -73,7 +74,7 @@ Agent({
 })
 ```
 
-Agents run in the background by default: the call returns an ID immediately and notifies you on completion, carrying a preview of the result (use `get_subagent_result` for the full text). Pass `run_in_background: false` to block until the agent finishes and get its full output inline.
+Agents run in the background by default: the call returns an ID immediately and notifies you on completion or a turn checkpoint, carrying a preview of the result (use `get_subagent_result` for the full text). Pass `run_in_background: false` to block until the agent finishes or pauses and get its output inline. Unfinished tasks pause every 25 turns by default; see [Turn checkpoints](#turn-checkpoints).
 
 ### Scheduling
 
@@ -102,7 +103,7 @@ Schedules are **session-scoped**: they reset on `/new` and restore on `/resume`.
 **Disable the feature entirely**: `/agents → Settings → Scheduling → disabled` removes `schedule` from the `Agent` tool spec (no LLM-context cost), hides the menu entry, and stops any active scheduler. The schema-level removal takes effect on the next pi session; the runtime kill is immediate. Re-enable from the same menu.
 
 Restrictions:
-- `schedule` cannot be combined with `inherit_context` (no parent conversation exists at fire time) or `resume` (schedules create fresh agents).
+- `schedule` cannot be combined with `inherit_context` (no parent conversation exists at fire time), `resume` (schedules create fresh agents), or explicit `pause_turns` (scheduled runs have no checkpoint approval step).
 - `run_in_background: false` is refused — scheduled jobs always run in the background. Omitting it, or passing `true`, is fine.
 - Scheduled fires bypass the `maxConcurrent` queue so a 5-minute interval cannot be deferred behind long-running manual agents.
 - **Headless `pi -p` doesn't wait for scheduled subagents.**
@@ -167,7 +168,7 @@ The handle names the **agent**, not one process, so a single syntax covers its w
 | State | `@explore fix the flaky test` does |
 |-------|-----------------------------------|
 | running or queued | sends the message into its conversation, exactly as `steer_subagent` would |
-| finished | **resumes** it in the background from its existing session, continuing where it left off |
+| paused or finished | **resumes** it in the background from its existing session, continuing where it left off |
 | finished long ago, record gone | **reopens** its session from disk and continues there |
 | never started | **starts** it — by default, through a clone of this conversation ([below](#starting-a-new-agent)) |
 
@@ -418,7 +419,8 @@ Launch a sub-agent.
 | `subagent_type` | string | yes | Agent type (built-in or custom) |
 | `model` | string | no | Model — `provider/modelId` or fuzzy name (`"haiku"`, `"sonnet"`). Resolved tolerantly (`.`/`-` and a trailing date stamp interchangeable) with provider fallback |
 | `thinking` | string | no | Thinking level: off, minimal, low, medium, high, xhigh, max (availability depends on pi version and model). Agent frontmatter wins over this parameter; `defaultEffort` fills in when neither sets one, and `forceDefaultEffort` overrides both |
-| `max_turns` | number | no | Max agentic turns. Omit for unlimited (default) |
+| `max_turns` | number | no | Conversation-wide turn ceiling, including live-session resumes; followed by the configured grace period. Omit for unlimited (default) |
+| `pause_turns` | integer | no | Pause after this many turns per execution segment (default `25`; `0` disables). Resume inherits the previous interval unless overridden. Not supported with `schedule` |
 | `run_in_background` | boolean | no | Defaults to `true`; `false` blocks and returns the result inline |
 | `resume` | string | no | Agent ID to resume a previous session |
 | `isolated` | boolean | no | No extension/MCP tools |
@@ -548,6 +550,28 @@ Settings                                    ← max concurrency (background + fo
 - **Create new agent** — choose project/personal location, then manual wizard (step-by-step prompts for name, tools, model, thinking, system prompt) or AI-generated (describe what the agent should do and a sub-agent writes the `.md` file). Any name is allowed, including default agent names (overrides them)
 - **Settings** — configure max concurrency (background and foreground), default max turns, grace turns, default model, force default model, default effort, force default effort, and join mode at runtime
 
+## Turn Checkpoints
+
+Top-level `Agent` calls and direct new-agent mentions use `pause_turns: 25` by default. This is a tool-enforced checkpoint, not a request that the child voluntarily stop. A turn means one assistant response plus its tool batch, using the same counter as `max_turns`.
+
+After the interval is reached, the current tool batch finishes and execution pauses before another model turn starts. A text-only final answer still completes normally, even at the checkpoint. Foreground calls return immediately with status `paused` and an agent ID; background calls send a pause notification without waiting for sibling tasks to finish. The notification identifies the segment and cumulative turn counts, duration, tool uses and latest output. That output may be an intermediate fragment, not a final summary.
+
+The parent should review progress before deciding whether to continue, redirect or leave the agent paused. To continue in the same conversation:
+
+```js
+Agent({
+  resume: "agent-id",
+  subagent_type: "general-purpose",
+  prompt: "Finish the remaining validation; do not repeat tests that already passed.",
+  description: "Finish remaining validation",
+  pause_turns: 10,
+})
+```
+
+Each resume starts a fresh checkpoint interval. Omitting `pause_turns` inherits the previous value; passing `0` disables checkpoints. The cumulative turn count and `max_turns` ceiling do not reset, and the ceiling takes precedence over a checkpoint. Paused sessions remain in memory rather than being evicted by the normal ten-minute sweep, and their worktrees remain available for continuation. A pause releases the concurrency slot and stops its owned nested agents. Already-written files are not rolled back; extensions may retain session resources while paused. Resume or explicitly stop paused agents to release retained worktrees; session shutdown also cleans them up. Reopening an archived agent within the same parent session preserves its checkpoint interval and cumulative turn budget. These counters are not persisted across process restart; reopening a session file after restart is not a durable checkpoint restore.
+
+This is **not a wall-clock timeout**: one long tool call can run beyond the interval's expected duration. Checkpoints are not enabled by default for nested delegation, workflow children, scheduled jobs or RPC/programmatic spawns. RPC callers can opt in with `options.pauseTurns`; the `Agent` tool can resume those sessions. `steer_subagent` only controls running agents, not paused ones.
+
 ## Graceful Max Turns
 
 Instead of hard-aborting at the turn limit, agents get a graceful shutdown:
@@ -559,6 +583,7 @@ Instead of hard-aborting at the turn limit, agents get a graceful shutdown:
 | Status | Meaning | Icon |
 |--------|---------|------|
 | `completed` | Finished naturally | `✓` green |
+| `paused` | Checkpoint reached; waiting for the parent to decide whether to resume | `‖` yellow |
 | `steered` | Hit limit, wrapped up in time | `✓` yellow |
 | `aborted` | Grace period exceeded | `✗` red |
 | `stopped` | User-initiated abort | `■` dim |
@@ -803,6 +828,7 @@ Agent lifecycle events are emitted via `pi.events.emit()` so other extensions ca
 |-------|------|------------|
 | `subagents:created` | `Agent`-tool background spawn, or a detached resume — **not** cross-extension RPC, scheduler, or `@handle` spawns, which are first seen at `subagents:started` | `id`, `type`, `description`, `isBackground` (always `true`) |
 | `subagents:started` | Agent transitions to running (including queued→running) | `id`, `type`, `description` |
+| `subagents:paused` | Agent reached a turn checkpoint; task is unfinished (background and foreground) | Same settlement payload as `subagents:completed`, with `status: "paused"`, `pauseTurns`, `segmentTurns`, `totalTurns`, and `maxTurns` when configured |
 | `subagents:completed` | Agent finished successfully (background and foreground) | `id`, `type`, `description`, `status`, `durationMs`, `tokens` (display total, `{ input, output, total }` — see the note below), `usage` (the run's spend as a pi `Usage`: token components including `cacheRead`, plus `cost.total` in USD; absent when nothing was spent), `toolUses`, `result` |
 | `subagents:failed` | Agent errored, stopped, or aborted (background and foreground) | identical payload to `subagents:completed` — both are built by the same formatter, so `error` and `status` are present on that row too, just empty |
 | `subagents:steered` | Steering message accepted — fires for a *queued* steer as well as a delivered one | `id`, `message` |
@@ -813,7 +839,7 @@ Agent lifecycle events are emitted via `pi.events.emit()` so other extensions ca
 | `subagents:settings_loaded` | Persisted settings applied at extension init | `settings` (merged global + project) |
 | `subagents:settings_changed` | `/agents` → Settings mutation was applied | `settings`, `persisted` (`boolean` — `false` on write failure) |
 
-The four agent-lifecycle events — `subagents:started`, `:completed`, `:failed`, `:compacted` — are emitted for **top-level agents only**. Nested subagents and a workflow's children emit nothing at all; they report through the parent or workflow that owns them.
+The five agent-lifecycle events — `subagents:started`, `:paused`, `:completed`, `:failed`, `:compacted` — are emitted for **top-level agents only**. Nested subagents and a workflow's children emit nothing at all; they report through the parent or workflow that owns them.
 
 `tokens.total` = `input + output + cacheWrite`. `cacheRead` is excluded — each turn's `cacheRead` is the cumulative cached prefix re-read on that one API call, so summing per-message would over-count it as a measure of work done. Use `contextUsage.percent` (surfaced as `(NN%)` in the widget) for current context size.
 
@@ -1032,6 +1058,7 @@ src/
   status-note.ts      # Honest status note + salvaged partial output for non-normal outcomes
   usage.ts            # Token usage shapes, accumulators, session-stats readers
   generation.ts       # Per-request model timing and local output TPS totals
+  turn-checkpoint.ts  # Safe turn-boundary pauses and per-segment checkpoint intervals
 
   # Invocation surface
   invocation-config.ts # Shared tool-parameter schemas (isolation, join, thinking, ...)

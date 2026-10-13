@@ -197,6 +197,57 @@ describe("ConversationViewer generation rate", () => {
   });
 });
 
+describe("ConversationViewer paused checkpoint", () => {
+  const flat = { fg: (_c: string, t: string) => t, bold: (t: string) => t } as any;
+
+  /** The overlay for a paused record, with the handlers a test cares about. */
+  function viewer(opts: { onStop?: () => void; onSteer?: (message: string) => void } = {}) {
+    return new ConversationViewer(
+      mockTui(30, 200),
+      mockSession([{ role: "user", content: "do the thing" }]),
+      mockRecord({ status: "paused", completedAt: Date.now() } as Partial<AgentRecord>),
+      undefined,
+      flat,
+      vi.fn(),
+      opts.onStop,
+      undefined,
+      opts.onSteer,
+    );
+  }
+
+  it("says it is held for a decision, not that it finished", () => {
+    const lines = viewer().render(200);
+    // The header row, located by the agent it describes — the content marker at
+    // the end of the transcript also says "paused".
+    const header = lines.find(l => l.includes("test agent")) ?? "";
+
+    expect(header).toContain("‖");
+    expect(header).toContain("paused");
+    expect(lines.join("\n")).toContain("awaiting the parent's decision");
+    expect(lines.join("\n")).not.toContain("✓");
+  });
+
+  it("offers x stop, so a held run can be released", () => {
+    const onStop = vi.fn();
+    const v = viewer({ onStop });
+
+    expect(v.render(200).join("\n")).toContain("x stop");
+    v.handleInput("x");
+    v.handleInput("x");
+
+    expect(onStop).toHaveBeenCalledOnce();
+  });
+
+  it("offers no steer composer, which a parked session cannot take", () => {
+    const v = viewer({ onSteer: vi.fn(), onStop: vi.fn() });
+
+    expect(v.render(200).join("\n")).not.toContain("Enter steer");
+    v.handleInput("\r");
+
+    expect(v.render(200).join("\n")).not.toContain("Enter send");
+  });
+});
+
 describe("ConversationViewer", () => {
   it("closes with Ctrl+C when not composing", () => {
     const done = vi.fn();

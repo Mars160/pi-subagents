@@ -18,6 +18,10 @@ import type { AgentRecord } from "./types.js";
  * `stopped` (a human aborted it) is deliberately distinct from `aborted` (the
  * turn limit was hit) — the parent should treat human intervention differently
  * from a budget cutoff.
+ *
+ * `paused` is a checkpoint, not a terminal status: the run stopped mid-task and
+ * only the parent can decide what happens next, so the note has to say that the
+ * output is partial and how the run continues.
  */
 export function getStatusNote(status: string): string {
   switch (status) {
@@ -27,6 +31,8 @@ export function getStatusNote(status: string): string {
       return " (aborted — hit the turn limit before completion; output may be incomplete)";
     case "steered":
       return " (wrapped up at the turn limit — output may be partial)";
+    case "paused":
+      return " (PAUSED — awaiting the parent's decision; output so far is partial; the task was NOT finished)";
     default:
       return "";
   }
@@ -45,7 +51,7 @@ export function getStatusNote(status: string): string {
  *     has nothing valid to call `get_subagent_result` with, and will invent an
  *     id (#174).
  *
- * Only the lead clause varies between the three, and each variation carries
+ * Only the lead clause varies between them, and each variation carries
  * information: `wrapped up` vs `aborted` tells the parent whether the output is
  * a considered final answer or a fragment, and `stopped` shouts because a human
  * intervening outranks everything else in the string. Only `steered` hedges on
@@ -65,6 +71,9 @@ export function getStatusNote(status: string): string {
  * improves parent behavior, so removing a false cue (which cannot induce new
  * behavior) and adding an instruction (which can) are not equally safe bets.
  * Don't add either back without a way to measure it.
+ *
+ * `paused` is not a confidence distinction: a checkpoint stopped mid-task, so
+ * the output is partial and the next move belongs to this reader.
  */
 export function getForegroundOutcomeNote(status: string): string {
   switch (status) {
@@ -74,6 +83,8 @@ export function getForegroundOutcomeNote(status: string): string {
       return " (aborted at the turn limit — everything the agent produced is above; the task is unfinished)";
     case "steered":
       return " (wrapped up at the turn limit — everything the agent produced is above; the task may be unfinished)";
+    case "paused":
+      return " (paused — awaiting your decision; everything the agent produced so far is above and is partial; the task is unfinished)";
     default:
       return "";
   }

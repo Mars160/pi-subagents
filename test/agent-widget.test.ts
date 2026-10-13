@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { renderRunningAgentStatus } from "../src/index.js";
 import type { WidgetMode } from "../src/types.js";
 import { type AgentActivity, AgentWidget, fgPreservingNestedStyles, formatCost, formatGenerationTps, formatSessionTokens } from "../src/ui/agent-widget.js";
@@ -247,6 +247,50 @@ describe("AgentWidget", () => {
     expect(lines).not.toContain("q1 description");
     for (const i of [1, 2, 3]) expect(lines).toContain(`fin${i} description`);
     expect(lines).not.toContain("more (");
+  });
+
+  // A paused row outlives the finished linger (its record is retained) and wears
+  // neither ✓ nor ✗.
+  it("shows a paused agent beyond the finished linger, with neither ✓ nor ✗", () => {
+    const held = {
+      ...makeRecord("held", { isBackground: true }),
+      status: "paused",
+      completedAt: Date.now() - 60_000,
+      segmentTurns: 7,
+      totalTurns: 12,
+      maxTurns: 40,
+    };
+    const widget = new AgentWidget({ listAgents: () => [held] } as any, new Map(), () => "background");
+    let factory: any;
+    widget.setUICtx({ setStatus: () => {}, setWidget: (_k, c) => { factory = c; } });
+    widget.markFinished("held");
+    // Well past the one-turn linger a completed agent gets.
+    for (let i = 0; i < 5; i++) widget.onTurnStart();
+    const lines = factory({ terminal: { columns: 200 }, requestRender: () => {} }, theme).render().join("\n");
+
+    expect(lines).toContain("held description");
+    expect(lines).toContain("‖");
+    expect(lines).toContain("paused");
+    // Cumulative turns against the cumulative limit, from the record: the live
+    // tracker's entry is gone by now, and a pause does not reset the count.
+    expect(lines).toContain("↻12≤40");
+    expect(lines).not.toContain("↻7");
+    expect(lines).not.toContain("✓");
+    expect(lines).not.toContain("✗");
+  });
+
+  // A paused agent is the whole widget's reason for being on screen — nothing
+  // else is running — so it keeps the widget registered and stays in the count.
+  it("keeps the widget and the status bar alive for a paused agent alone", () => {
+    const held = { ...makeRecord("held", { isBackground: true }), status: "paused" };
+    const widget = new AgentWidget({ listAgents: () => [held] } as any, new Map(), () => "background");
+    const setStatus = vi.fn();
+    let factory: any;
+    widget.setUICtx({ setStatus, setWidget: (_k, c) => { factory = c; } });
+    widget.update();
+
+    expect(setStatus).toHaveBeenCalledWith("subagents", "1 paused agent");
+    expect(factory).toBeTruthy();
   });
 
   // "off" hides the widget entirely — even a background agent renders nothing.

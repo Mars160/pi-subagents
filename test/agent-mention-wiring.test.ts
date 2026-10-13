@@ -445,9 +445,9 @@ describe("mentioning an agent that has never run", () => {
 
   });
 
-  it("leaves model, thinking and max turns to the agent's own config", async () => {
-    // runAgent resolves all three from the config when the spawn omits them,
-    // so passing anything here would override frontmatter the user wrote.
+  it("leaves model and thinking to config and passes the resolved unlimited turn budget", async () => {
+    // The manager resolves the turn budget once, before queuing the run.
+    // Zero explicitly preserves unlimited execution in the runner.
     const { lifecycle } = bootDirect();
     heldRun(fakeSession());
 
@@ -456,14 +456,13 @@ describe("mentioning an agent that has never run", () => {
     const opts = vi.mocked(runAgent).mock.calls[0][3] as any;
     expect(opts.model).toBeUndefined();
     expect(opts.thinkingLevel).toBeUndefined();
-    expect(opts.maxTurns).toBeUndefined();
+    expect(opts.maxTurns).toBe(0);
 
   });
 
   it("shows the turn limit it will actually be held to (#181)", async () => {
-    // The spawn passes no maxTurns on purpose (see the test above), so the
-    // tracker has to resolve the same limit runAgent will enforce — otherwise
-    // the row reads `↻1` where the Agent tool would read `↻1≤9`.
+    // The tracker and manager must resolve the same ceiling, so the row
+    // displays the budget the runner will enforce.
     const prevMax = getDefaultMaxTurns();
     try {
       const { lifecycle } = bootDirect({ defaultMaxTurns: 9 });

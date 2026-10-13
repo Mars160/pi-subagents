@@ -12,7 +12,7 @@ import { extractText } from "../context.js";
 import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
 import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent } from "../usage.js";
 import type { Theme } from "./agent-widget.js";
-import { type AgentActivity, buildInvocationTags, describeActivity, fgPreservingNestedStyles, formatCost, formatDuration, formatGenerationTps, formatSessionTokens, getPromptModeLabel } from "./agent-widget.js";
+import { type AgentActivity, buildInvocationTags, describeActivity, fgPreservingNestedStyles, formatCost, formatDuration, formatGenerationTps, formatSessionTokens, getPromptModeLabel, isPausedStatus } from "./agent-widget.js";
 import { createViewerKeys, type ViewerKeybindings, type ViewerKeys } from "./viewer-keys.js";
 
 /** Base lines consumed by chrome: top border + header + header sep + footer sep + footer + bottom border. */
@@ -297,18 +297,23 @@ export class ConversationViewer implements Component {
     lines.push(hrTop);
     const modeLabel = getPromptModeLabel(this.record.type);
     const modeTag = modeLabel ? ` ${th.fg("dim", `(${modeLabel})`)}` : "";
+    // `‖` for a checkpoint: not the running `●` (nothing streams) and not the
+    // `○` fallback, which reads as settled.
     const statusIcon = this.record.status === "running"
       ? th.fg("accent", "●")
-      : this.record.status === "completed"
-        ? th.fg("success", "✓")
-        : this.record.status === "error"
-          ? th.fg("error", "✗")
-          : th.fg("dim", "○");
+      : isPausedStatus(this.record.status)
+        ? th.fg("warning", "‖")
+        : this.record.status === "completed"
+          ? th.fg("success", "✓")
+          : this.record.status === "error"
+            ? th.fg("error", "✗")
+            : th.fg("dim", "○");
     const duration = formatDuration(this.record.startedAt, this.record.completedAt);
 
     const headerParts: string[] = [duration];
     const toolUses = this.activity?.toolUses ?? this.record.toolUses;
     if (toolUses > 0) headerParts.unshift(`${toolUses} tool${toolUses === 1 ? "" : "s"}`);
+    if (isPausedStatus(this.record.status)) headerParts.unshift(th.fg("warning", "paused"));
     // The rate reflects the agent's own stream timings, not the task clock, so
     // it is reported alongside the elapsed time. Absent when the record has no
     // successful assistant message — see formatGenerationTps.
@@ -392,9 +397,13 @@ export class ConversationViewer implements Component {
     return lines;
   }
 
-  /** Stoppable only when a stop handler exists and the agent is still active. */
+  /**
+   * Stoppable while a stop handler exists and the run can still be released: a
+   * paused checkpoint holds its worktree and session open, and `x` frees them.
+   */
   private isStoppable(): boolean {
-    return !!this.onStop && (this.record.status === "running" || this.record.status === "queued");
+    return !!this.onStop
+      && (this.record.status === "running" || this.record.status === "queued" || isPausedStatus(this.record.status));
   }
 
   /** The mode in force: an `m` press, else the setting, else the default. */
@@ -453,7 +462,11 @@ export class ConversationViewer implements Component {
     }
   }
 
-  /** Steerable only when a steer handler exists and the agent is still active. */
+  /**
+   * Steerable only while the agent is working: `steer` rejects a paused run, so
+   * the composer would promise a delivery that cannot happen. `resume` continues
+   * one instead.
+   */
   private canSteer(): boolean {
     return !!this.onSteer && (this.record.status === "running" || this.record.status === "queued");
   }
@@ -587,6 +600,13 @@ export class ConversationViewer implements Component {
       const act = describeActivity(this.activity.activeTools, this.activity.responseText);
       lines.push("");
       lines.push(truncateToWidth(th.fg("accent", "▍ ") + th.fg("dim", act), width));
+    } else if (isPausedStatus(this.record.status)) {
+      // Paused: no stream, so a marker instead of the spinner line.
+      lines.push("");
+      lines.push(truncateToWidth(
+        th.fg("warning", "‖ ") + th.fg("dim", "paused — awaiting the parent's decision"),
+        width,
+      ));
     }
 
     return lines.map(l => truncateToWidth(l, width));

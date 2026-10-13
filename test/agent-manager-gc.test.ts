@@ -14,6 +14,11 @@ import { AgentManager } from "../src/agent-manager.js";
 vi.mock("../src/agent-runner.js", () => ({
   runAgent: vi.fn(),
   resumeAgent: vi.fn(),
+  // The manager reads a conversation's cumulative turn ceiling and grace window
+  // through the runner rather than re-deriving them.
+  resolveEffectiveMaxTurns: vi.fn((_type: string, explicit?: number) => explicit),
+  normalizeMaxTurns: vi.fn((n?: number) => (n ? n : undefined)),
+  getGraceTurns: vi.fn(() => 5),
 }));
 
 vi.mock("../src/worktree.js", () => ({

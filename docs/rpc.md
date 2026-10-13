@@ -1,6 +1,6 @@
 # Driving subagents from another extension
 
-Another pi extension can spawn a subagent, listen for subagent completion, read the result and stop the run — all over the `pi.events` bus, without importing this package directly. Four request/reply channels (`subagents:rpc:ping`, `subagents:rpc:spawn`, `subagents:rpc:stop`, `subagents:rpc:consume`), eleven lifecycle events, and one in-process registry at `Symbol.for("pi-subagents:manager")`.
+Another pi extension can spawn a subagent, listen for subagent completion, read the result and stop the run — all over the `pi.events` bus, without importing this package directly. Four request/reply channels (`subagents:rpc:ping`, `subagents:rpc:spawn`, `subagents:rpc:stop`, `subagents:rpc:consume`), twelve lifecycle events, and one in-process registry at `Symbol.for("pi-subagents:manager")`.
 
 The thing worth understanding up front is that **the bus is in-process.** Every "RPC" call here is a synchronous `pi.events.emit` into the same event loop, and every reply comes back the same way. That single fact explains most of what follows: why `signal` and the `on*` callbacks work on a spawn payload at all, why a `consume` fired inside a `subagents:completed` handler lands *before* the notification decision has been made, and why none of this survives a real process boundary.
 
@@ -17,7 +17,8 @@ For the channel list, the reply envelope, the per-channel snippets and the event
 | `description` | string | What the agent is doing. Shown in the widget, FleetView and the completion notification |
 | `name` | string | A memorable second handle (`@auth-audit`). Slugged, never validated — anything unusable degrades rather than failing the spawn |
 | `model` | `Model` **or** `"provider/modelId"` | Strings are resolved at the RPC boundary against `ctx.modelRegistry`. `null` means inherit, not override. Resolution is fuzzy — see [Model Scope](../README.md#model-scope). A configured `defaultModel` fills in when the payload sends none, and `forceDefaultModel` replaces whatever it sent (see below) |
-| `maxTurns` | number | Turn ceiling for the run |
+| `maxTurns` | number | Conversation-wide turn ceiling, including live-session resumes |
+| `pauseTurns` | integer | Opt-in checkpoint interval; omitted or `0` disables on this programmatic path. Finishes the current tool batch and settles as `paused`, not completed |
 | `isolated` | boolean | Strips extensions, skills and nested tools. **Not** a git worktree — see the trap table below |
 | `inheritContext` | boolean | Fork the parent conversation into the child |
 | `thinkingLevel` | ThinkingLevel | Clamped to what the resolved model supports. Takes precedence over agent frontmatter on this programmatic path; `defaultEffort` fills in when neither sets a level, and `forceDefaultEffort` overrides both |
@@ -65,7 +66,7 @@ One of these already shipped as a bug in this project's own README example, so i
 | `isolated: true` | Disables extensions, skills and nested tools | `isolation: "worktree"` for a git worktree |
 | `isolation: "worktree"` | Creates a git worktree | `isolated: true` to strip capabilities |
 | `configCwd` | Stripped | `cwd` |
-| `max_turns` / `thinking` / `inherit_context` | Ignored — tool and frontmatter spellings | `maxTurns` / `thinkingLevel` / `inheritContext` |
+| `max_turns` / `pause_turns` / `thinking` / `inherit_context` | Ignored — tool and frontmatter spellings | `maxTurns` / `pauseTurns` / `thinkingLevel` / `inheritContext` |
 | `memory` | Nothing. **There is no such option** | Memory scope comes only from the agent definition's frontmatter |
 
 **None of these produce an error.** Option keys are not validated on this path at all — unknown ones are accepted and dropped. (Contrast `agent()` inside a [workflow](workflows.md), which rejects unknown keys by name.)
@@ -111,7 +112,13 @@ Two asymmetries to know about, stated as they are:
 - **Stop takes an id only** (`src/index.ts:806`). Consume takes an id *or* an `@handle`, through `resolveAgentRef` (`src/index.ts:816` → `:731-736`).
 - **Consume checks `parentAgentId` but not `workflowId`** (`src/index.ts:816`). A workflow-owned agent's result can be marked consumed over the bus even though the same agent cannot be stopped.
 
-The same predicate silently scopes the events. **Every lifecycle event is top-level only** — `subagents:started`, `:completed`, `:failed` and `:compacted` all return early for nested and workflow-owned agents (`src/index.ts:573`, `:615`, `:631`). A workflow's children are invisible on the bus: you will see the workflow's own agents come and go without a single event.
+The same predicate silently scopes the events. **Every lifecycle event is top-level only** — `subagents:started`, `:paused`, `:completed`, `:failed` and `:compacted` all return early for nested and workflow-owned agents (`src/index.ts:573`, `:615`, `:631`). A workflow's children are invisible on the bus: you will see the workflow's own agents come and go without a single event.
+
+## Turn checkpoints
+
+RPC spawns do not enable checkpoints by default. Set `options.pauseTurns` to opt in. A checkpoint emits `subagents:paused` with the usual settlement payload and `status: "paused"`; it does **not** emit `subagents:completed` or `subagents:failed`. The task is unfinished even though the current execution segment has settled. Consumers must handle this event separately rather than treating partial output as a final answer. Background pause notifications are delivered individually, without waiting for sibling tasks.
+
+The paused session remains resumable and retains its worktree. There is no resume RPC channel; continue through the parent session's `Agent({ resume: id, prompt: ..., description: ..., subagent_type: ... })` tool or `@handle message`. The next segment inherits the interval unless the Agent call overrides `pause_turns`, and cumulative turn limits remain in effect. `waitForAll()` resolves when no agents are running or queued; paused agents do not keep it waiting. See [Turn checkpoints](../README.md#turn-checkpoints) for lifetime and cleanup behavior.
 
 ## The notification race
 

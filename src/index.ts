@@ -53,6 +53,7 @@ import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
+import { DEFAULT_PAUSE_TURNS } from "./turn-checkpoint.js";
 import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
 import {
@@ -181,8 +182,33 @@ function getStatusLabel(status: string, error?: string): string {
     case "aborted": return "Aborted (max turns exceeded)";
     case "steered": return "Wrapped up (turn limit)";
     case "stopped": return "Stopped";
+    case "paused": return "Paused at a checkpoint (output is partial)";
     default: return "Done";
   }
+}
+
+/** Foreground text for a paused checkpoint: partial output, the id to continue it, and the decision. */
+export function formatPausedForeground(record: AgentRecord, lead: string): string {
+  const segment = record.segmentTurns;
+  const total = record.totalTurns ?? segment;
+  const progress = [
+    segment !== undefined ? `${segment} turn${segment === 1 ? "" : "s"} in this run` : null,
+    total !== undefined ? `${total} turns in total` : null,
+    record.maxTurns !== undefined ? `limit ${record.maxTurns}` : null,
+    record.toolUses > 0 ? `${record.toolUses} tool use${record.toolUses === 1 ? "" : "s"}` : null,
+    formatMs((record.completedAt ?? Date.now()) - record.startedAt),
+  ].filter(Boolean).join(", ");
+
+  return (
+    `${lead}Agent paused at a checkpoint after ${progress}.\n` +
+    `Agent ID: ${record.id}\n\n` +
+    `Output so far:\n${record.result?.trim() || "(nothing yet)"}\n\n` +
+    // The note's "everything produced so far is above" holds: the output is.
+    `${getForegroundOutcomeNote(record.status).trim()} ` +
+    `The agent stopped mid-task and will not continue on its own. Decide what happens next:\n` +
+    `- Continue: call Agent with resume: "${record.id}" and a prompt saying what is left to do (everything above is its context).\n` +
+    `- Accept it: treat the output as final and report what did and did not get done.`
+  );
 }
 
 /** Format a structured task notification matching Claude Code's <task-notification> XML. */
@@ -197,6 +223,11 @@ function formatTaskNotification(record: AgentRecord, resultMaxLen: number, showC
   // did not ask for is a figure it may start reporting unprompted.
   const cost = showCost ? getLifetimeCost(record.lifetimeUsage) : 0;
   const costXml = cost > 0 ? `<estimated_cost_usd>${cost.toFixed(4)}</estimated_cost_usd>` : "";
+  // Segment + cumulative turns, on a pause only: they are what the decision
+  // covers, and what the unreset `max_turns` ceiling applies to.
+  const turnCountsXml = record.status === "paused"
+    ? `<segment_turns>${record.segmentTurns ?? 0}</segment_turns><total_turns>${record.totalTurns ?? 0}</total_turns>`
+    : "";
 
   const resultPreview = record.result
     ? record.result.length > resultMaxLen
@@ -212,7 +243,7 @@ function formatTaskNotification(record: AgentRecord, resultMaxLen: number, showC
     `<status>${escapeXml(status)}</status>`,
     `<summary>Agent "${escapeXml(record.description)}" ${record.status}${getStatusNote(record.status)}</summary>`,
     `<result>${escapeXml(resultPreview)}</result>`,
-    `<usage><total_tokens>${totalTokens}</total_tokens><tool_uses>${record.toolUses}</tool_uses>${ctxXml}${compactXml}${costXml}<duration_ms>${durationMs}</duration_ms></usage>`,
+    `<usage><total_tokens>${totalTokens}</total_tokens><tool_uses>${record.toolUses}</tool_uses>${turnCountsXml}${ctxXml}${compactXml}${costXml}<duration_ms>${durationMs}</duration_ms></usage>`,
     `</task-notification>`,
   ].filter(Boolean).join('\n');
 }
@@ -248,14 +279,17 @@ function buildDetails(
 /** Build notification details for the custom message renderer. */
 function buildNotificationDetails(record: AgentRecord, resultMaxLen: number, activity?: AgentActivity): NotificationDetails {
   const totalTokens = getLifetimeTotal(record.lifetimeUsage);
+  // A paused record's counts come off the record: its tracker is gone by the
+  // time the nudge fires, and the cumulative count never lived in one.
+  const paused = record.status === "paused";
 
   return {
     id: record.id,
     description: record.description,
     status: record.status,
     toolUses: record.toolUses,
-    turnCount: activity?.turnCount ?? 0,
-    maxTurns: activity?.maxTurns,
+    turnCount: activity?.turnCount ?? (paused ? record.totalTurns ?? record.segmentTurns ?? 0 : 0),
+    maxTurns: activity?.maxTurns ?? (paused ? record.maxTurns : undefined),
     totalTokens,
     // Carried unconditionally; the renderer gates on the setting. Details are
     // data, and a notification rendered before a mid-session toggle should not
@@ -334,8 +368,12 @@ export default function (pi: ExtensionAPI) {
 
       function renderOne(d: NotificationDetails): string {
         const isError = d.status === "error" || d.status === "stopped" || d.status === "aborted";
-        const icon = isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
+        const isPaused = d.status === "paused";
+        const icon = isError ? theme.fg("error", "✗")
+          : isPaused ? theme.fg("warning", "‖")
+          : theme.fg("success", "✓");
         const statusText = isError ? d.status
+          : isPaused ? "paused at a checkpoint (output is partial)"
           : d.status === "steered" ? "completed (steered)"
           : "completed";
 
@@ -521,7 +559,9 @@ export default function (pi: ExtensionAPI) {
       const groupKey = `group:${records.map(r => r.id).join(",")}`;
       scheduleNudge(groupKey, () => {
         // Re-check at send time
-        const unconsumed = records.filter(r => !r.resultConsumed);
+        // Paused records are delivered individually; a joined notification must
+        // not frame a checkpoint as an agent that finished.
+        const unconsumed = records.filter(r => !r.resultConsumed && r.status !== "paused");
         if (unconsumed.length === 0) { widget.update(); return; }
 
         const notifications = unconsumed.map(r => formatTaskNotification(r, 300, showCost)).join('\n\n');
@@ -582,6 +622,13 @@ export default function (pi: ExtensionAPI) {
       durationMs,
       tokens,
       usage,
+      // Checkpoint counters, on the paused event only: how far the run got.
+      ...(record.status === "paused" ? {
+        ...(record.pauseTurns !== undefined ? { pauseTurns: record.pauseTurns } : {}),
+        ...(record.segmentTurns !== undefined ? { segmentTurns: record.segmentTurns } : {}),
+        ...(record.totalTurns !== undefined ? { totalTurns: record.totalTurns } : {}),
+        ...(record.maxTurns !== undefined ? { maxTurns: record.maxTurns } : {}),
+      } : {}),
     };
   }
 
@@ -593,10 +640,13 @@ export default function (pi: ExtensionAPI) {
     // notification, and UI channels.
     if (!isTopLevelAgent(record)) return;
 
-    // Emit lifecycle event based on terminal status
+    // A checkpoint is neither a completion nor a failure, so it gets its own
+    // event: `subagents:completed` must not mean "stopped mid-task".
     const isError = record.status === "error" || record.status === "stopped" || record.status === "aborted";
     const eventData = buildEventData(record);
-    if (isError) {
+    if (record.status === "paused") {
+      pi.events.emit("subagents:paused", eventData);
+    } else if (isError) {
       pi.events.emit("subagents:failed", eventData);
     } else {
       pi.events.emit("subagents:completed", eventData);
@@ -614,6 +664,20 @@ export default function (pi: ExtensionAPI) {
       agentActivity.delete(record.id);
       widget.markFinished(record.id);
       fleet.onAgentFinished(record.id);
+      widget.update();
+      return;
+    }
+
+    // Delivered on its own, now: the decision it asks for is whether to spend
+    // more turns. Still fed to the group bookkeeping (which drops paused records
+    // from its delivery) so a group does not wait out its timeout for a member
+    // that will never "complete".
+    if (record.status === "paused") {
+      currentBatchAgents = currentBatchAgents.filter(a => a.id !== record.id);
+      // A snapshot: the callback filters on status at delivery time, and this
+      // record is resumed (or completed) by then.
+      groupJoin.onAgentComplete({ ...record });
+      sendIndividualNudge(record);
       widget.update();
       return;
     }
@@ -732,6 +796,9 @@ export default function (pi: ExtensionAPI) {
     // conversation. Only the mention dispatcher may set it, and only from a
     // path this extension itself recorded — never from anything a caller sent.
     delete safeOptions.resumeSessionFile;
+    // Also internal: it advances a conversation's spent turn budget, so a
+    // forged negative value would hand a caller turns it never ran.
+    delete safeOptions.turnOffset;
     // Bypasses handle allocation, so a forged value would duplicate a live
     // agent's name and make `@handle` ambiguous. Same rule: dispatcher only.
     delete safeOptions.reclaim;
@@ -953,7 +1020,6 @@ export default function (pi: ExtensionAPI) {
         const config = getAgentConfig(record.type);
         const resumedRecord = await startBackgroundResume(ctx, record, mention.message, {
           outputTranscript: config?.outputTranscript ?? getOutputTranscriptDefault(),
-          maxTurns: normalizeMaxTurns(config?.maxTurns ?? getDefaultMaxTurns()),
         });
         ctx.ui.notify(
           resumedRecord ? `Resuming ${target}` : `Could not resume ${target} — it is still running.`,
@@ -1009,6 +1075,11 @@ export default function (pi: ExtensionAPI) {
           description: entry.description,
           reclaim: { handle: entry.handle, alias: entry.alias },
           resumeSessionFile: entry.sessionFile,
+          // The archived conversation's budget, not a fresh one: its interval,
+          // the turns it already spent, and its ceiling (0 = none inherited).
+          pauseTurns: entry.pauseTurns ?? 0,
+          maxTurns: entry.maxTurns ?? 0,
+          turnOffset: entry.totalTurns ?? 0,
           isBackground: true,
         });
         // The agent may still be starting — wait, so a startup failure lands in
@@ -1071,6 +1142,7 @@ export default function (pi: ExtensionAPI) {
           try {
             const id = spawnTopLevel(pi, ctx, type, mention.message, {
               description: describeMention(mention.message),
+              pauseTurns: DEFAULT_PAUSE_TURNS,
               isBackground: true,
             });
             // Same reason as the direct path below: the agent may still be
@@ -1095,6 +1167,7 @@ export default function (pi: ExtensionAPI) {
       // cross-extension RPC spawns run under.
       const id = spawnTopLevel(pi, ctx, type, mention.message, {
         description: describeMention(mention.message),
+        pauseTurns: DEFAULT_PAUSE_TURNS,
         isBackground: true,
       });
       // The agent may still be starting (a worktree copy is an awaited git
@@ -1306,9 +1379,12 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionContext,
     existing: AgentRecord,
     prompt: string,
-    opts: { outputTranscript: boolean; maxTurns?: number; toolCallId?: string },
+    opts: { outputTranscript: boolean; maxTurns?: number; pauseTurns?: number; toolCallId?: string },
   ): Promise<AgentRecord | undefined> {
     const id = existing.id;
+    // A held checkpoint notice is stale the moment the next segment starts: it
+    // captures the record, which resume() mutates (status, result, counters).
+    cancelNudge(id);
     const joinMode = resolveJoinMode(defaultJoinMode, true);
     // Assigned unconditionally: the completion notification carries this as
     // `<tool-use-id>`, so a mention-resume (which passes none) has to CLEAR the
@@ -1339,6 +1415,9 @@ export default function (pi: ExtensionAPI) {
     // run_in_background in that same turn keep going.
     const record = await manager.resume(id, prompt, undefined, {
       isBackground: true,
+      // Only when named: otherwise the record keeps its interval and ceiling.
+      ...(opts.pauseTurns !== undefined ? { pauseTurns: opts.pauseTurns } : {}),
+      ...(opts.maxTurns !== undefined ? { maxTurns: opts.maxTurns } : {}),
       onToolActivity: bgCallbacks.onToolActivity,
       onAssistantUsage: bgCallbacks.onAssistantUsage,
       // Fires when the run actually starts — immediately, or on queue
@@ -1515,7 +1594,7 @@ Notes:
 - Parallel work: one message, multiple Agent calls — they run concurrently.
 - Subagents run in the background by default; you'll be notified when one completes. Pass run_in_background: false only when your very next action depends on the result and nothing else could usefully happen while it runs. Never fabricate or predict a pending agent's results — if the user asks before the notification arrives, say it's still running.
 - The result is not shown to the user — summarize it for them. Verify an agent's claimed code changes before reporting work done.
-- resume continues a previous agent by ID; steer_subagent messages a running one.${isolationCompactGuideline}`;
+- resume continues a previous agent by ID; steer_subagent messages a running one. Agents pause every ${DEFAULT_PAUSE_TURNS} turns by default (pause_turns: 0 disables) and return PARTIAL output plus the ID — review before resuming.${isolationCompactGuideline}`;
 
   const fullAgentToolDescription = `Launch a new agent to handle complex, multi-step tasks autonomously. Each agent type has specific capabilities and tools available to it.
 
@@ -1539,6 +1618,7 @@ If the target is already known, use a direct tool — \`read\` for a known path,
 - Agents run in the background by default. When an agent runs in the background, you will be automatically notified when it completes — do NOT sleep, poll, or proactively check on its progress. Continue with other work or respond to the user instead.
 - **Foreground vs background**: Pass \`run_in_background: false\` only when your very next action depends on the agent's result and nothing else could usefully happen while it runs — e.g., a research agent whose finding gates the edit you're about to make. Otherwise let it run in the background (the default) — this includes fire-and-forget work, independent investigations, and anything where the user might hand you something else in the meantime. Wanting the result "next" is not enough on its own.
 - **Don't race**: after launching a background agent, you know nothing about its results. Never fabricate or predict them in any format — not as prose, summary, or structured output. The completion notification arrives in a later turn; it is never something you write yourself. If the user asks before it lands, say the agent is still running — give status, not a guess.
+- **Checkpoints**: every agent pauses after ${DEFAULT_PAUSE_TURNS} turns by default (pause_turns) and hands the result back as PARTIAL output plus the agent ID, so you can review its progress before it carries on. A paused agent will NOT continue on its own. Read what it produced, then either resume it (resume: the returned ID, with a prompt saying what is left) or accept the partial work as final — never resume it blindly just because it paused. Set pause_turns: 0 to run an agent to completion with no checkpoints.
 - Use resume with an agent ID to continue a previous agent's work. A new (non-resume) Agent call starts a fresh agent with no memory of prior runs, so the prompt must be self-contained.
 - Use steer_subagent to send mid-run messages to a running background agent.
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, etc.), since it is not aware of the user's intent.
@@ -1664,6 +1744,15 @@ Terse command-style prompts produce shallow, generic work.
           minimum: 1,
         }),
       ),
+      pause_turns: Type.Optional(
+        Type.Integer({
+          description:
+            "Checkpoint interval: pause the agent after this many turns so you can review its progress and decide whether to continue. " +
+            `Default ${DEFAULT_PAUSE_TURNS}. Set 0 to disable checkpoints and let the agent run to completion unattended. ` +
+            "A paused run returns PARTIAL output plus the agent ID to resume.",
+          minimum: 0,
+        }),
+      ),
       run_in_background: Type.Optional(
         Type.Boolean({
           description: "Defaults to true — the agent runs detached, returning its ID immediately, and you are notified on completion. Set false only when your very next action depends on the result; the call then blocks and returns the agent's full output inline.",
@@ -1750,6 +1839,16 @@ Terse command-style prompts produce shallow, generic work.
       // ---- Background agent launched ----
       if (details.status === "background") {
         return new Text(theme.fg("dim", `  ⎿  Running in background (ID: ${details.agentId})`), 0, 0);
+      }
+
+      // ---- Paused at a checkpoint (unfinished, resumable) ----
+      // Without its own branch this falls through to raw text, losing the id.
+      if ((details.status as string) === "paused") {
+        const s = stats(details);
+        let line = theme.fg("warning", "‖") + (s ? " " + s : "");
+        line += " " + theme.fg("dim", "·") + " " + theme.fg("dim", formatMs(details.durationMs));
+        line += "\n" + theme.fg("dim", `  ⎿  Paused at a checkpoint — task unfinished; resume with Agent (${details.agentId})`);
+        return new Text(line, 0, 0);
       }
 
       // ---- Completed / Steered ----
@@ -1914,6 +2013,10 @@ Terse command-style prompts produce shallow, generic work.
         return resolvedAsked.provider === model?.provider && resolvedAsked.id === model?.id ? undefined : asked;
       })(resolvedConfig.overridden?.model);
       const effectiveMaxTurns = normalizeMaxTurns(resolvedConfig.maxTurns ?? getDefaultMaxTurns());
+      // Raw beside effective: omitted means the default on a spawn but inherit
+      // on a resume.
+      const requestedPauseTurns = params.pause_turns;
+      const effectivePauseTurns = requestedPauseTurns ?? DEFAULT_PAUSE_TURNS;
       const agentInvocation: AgentInvocation = {
         modelName,
         modelId,
@@ -1925,6 +2028,7 @@ Terse command-style prompts produce shallow, generic work.
         // Explicit value only — the default fallback would just add noise.
         // Normalize so `0` (unlimited) doesn't surface as a misleading "max turns: 0".
         maxTurns: normalizeMaxTurns(resolvedConfig.maxTurns),
+        pauseTurns: effectivePauseTurns,
         isolated,
         inheritContext,
         runInBackground,
@@ -1984,6 +2088,12 @@ Terse command-style prompts produce shallow, generic work.
         if (params.run_in_background === false) {
           return textResult("Cannot combine `schedule` with `run_in_background: false` — scheduled jobs always run in background.");
         }
+        if (params.pause_turns !== undefined) {
+          return textResult(
+            "Cannot combine `pause_turns` with `schedule` — a scheduled job fires unattended, so there is nobody to review a checkpoint. " +
+            "Drop `pause_turns` to schedule it, or drop `schedule` to run it now with checkpoints.",
+          );
+        }
         if (!scheduler.isActive()) {
           return textResult("Scheduler is not active in this session yet. Try again after the session has fully started.");
         }
@@ -2016,8 +2126,76 @@ Terse command-style prompts produce shallow, generic work.
       // Resume existing agent
       if (params.resume) {
         const existing = manager.getRecord(params.resume);
-        if (!existing || !isTopLevelAgent(existing)) {
+        if (existing && !isTopLevelAgent(existing)) {
           return textResult(`Agent not found: "${params.resume}". It may have been cleaned up.`);
+        }
+        // Archived (evicted) conversation: the record is gone, but the tombstone
+        // holds its session file and the budget this segment must continue. A
+        // reopen that reset either would hand the conversation a fresh run — the
+        // budget bypass a resume must never be.
+        if (!existing) {
+          const archived = manager.resolveMention(params.resume);
+          if (archived?.kind !== "tombstone") {
+            return textResult(`Agent not found: "${params.resume}". It may have been cleaned up.`);
+          }
+          const entry = archived.entry;
+          if (!existsSync(entry.sessionFile)) {
+            manager.dropTombstone(entry.handle);
+            return textResult(`Cannot resume "${params.resume}" — its session is gone.`);
+          }
+          // The archived type must still resolve: reopening this conversation
+          // under a substitute is not continuing it (same rule as a mention).
+          reloadCustomAgents();
+          const archivedDispatch = resolveSpawnType(entry.type);
+          if (!archivedDispatch.ok || archivedDispatch.fellBackFrom !== undefined) {
+            return textResult(`Cannot resume "${params.resume}" — the ${entry.type} agent is no longer available.`);
+          }
+          const reopen = {
+            description: entry.description,
+            reclaim: { handle: entry.handle, alias: entry.alias },
+            resumeSessionFile: entry.sessionFile,
+            // The caller's explicit values only: otherwise the archived
+            // conversation keeps its own interval and ceiling, and `0` means
+            // "none" rather than a freshly resolved default.
+            pauseTurns: requestedPauseTurns ?? entry.pauseTurns ?? 0,
+            maxTurns: normalizeMaxTurns(params.max_turns) ?? entry.maxTurns ?? 0,
+            turnOffset: entry.totalTurns ?? 0,
+          };
+          if (runInBackground) {
+            const id = spawnResolved(pi, ctx, archivedDispatch.type, params.prompt, { ...reopen, isBackground: true });
+            await manager.awaitStartup(id);
+            return textResult(
+              `Agent resumed in background from its archived conversation.\n` +
+              `Agent ID: ${id}\n` +
+              `Type: ${entry.type}\n` +
+              `\nYou will be notified when this agent completes.\n` +
+              `Use get_subagent_result to retrieve full results, or steer_subagent to send it messages.`,
+              {
+                ...detailBase,
+                displayName: getDisplayName(entry.type),
+                subagentType: entry.type,
+                description: entry.description,
+                toolUses: 0,
+                tokens: "",
+                durationMs: 0,
+                status: "background" as const,
+                agentId: id,
+              },
+            );
+          }
+          const { record } = await manager.spawnAndWait(pi, ctx, archivedDispatch.type, params.prompt, reopen);
+          if (record.status === "error") {
+            return textResult(`Agent failed: ${record.error}${partialOutputSuffix(record)}`, buildDetails(detailBaseFor(record), record));
+          }
+          if (record.status === "paused") {
+            return textResult(formatPausedForeground(record, ""), buildDetails(detailBaseFor(record), record));
+          }
+          // A resumed segment can end on the ceiling or be stopped: label it
+          // like a foreground spawn, rather than returning bare text.
+          return textResult(
+            (record.result?.trim() || "No output.") + getForegroundOutcomeNote(record.status),
+            buildDetails(detailBaseFor(record), record),
+          );
         }
         if (!existing.session) {
           return textResult(`Agent "${params.resume}" has no active session to resume.`);
@@ -2044,6 +2222,7 @@ Terse command-style prompts produce shallow, generic work.
           const record = await startBackgroundResume(ctx, existing, params.prompt, {
             outputTranscript,
             maxTurns: effectiveMaxTurns,
+            pauseTurns: requestedPauseTurns,
             toolCallId,
           });
           if (!record) {
@@ -2063,7 +2242,14 @@ Terse command-style prompts produce shallow, generic work.
           );
         }
 
-        const record = await manager.resume(params.resume, params.prompt, signal);
+        // Superseded by this resume, like the detached path: the held record is
+        // about to be mutated, so a stale notice would render the next segment.
+        cancelNudge(existing.id);
+        const record = await manager.resume(params.resume, params.prompt, signal, {
+          // Explicit values only: omitting them leaves the record its own.
+          ...(requestedPauseTurns !== undefined ? { pauseTurns: requestedPauseTurns } : {}),
+          ...(effectiveMaxTurns !== undefined ? { maxTurns: effectiveMaxTurns } : {}),
+        });
         if (!record) {
           return textResult(`Failed to resume agent "${params.resume}".`);
         }
@@ -2072,8 +2258,14 @@ Terse command-style prompts produce shallow, generic work.
         if (record.status === "error") {
           return textResult(`Agent failed: ${record.error}${partialOutputSuffix(record)}`, buildDetails(detailBaseFor(record), record));
         }
+        // A resume can pause too; the fragment must not read as a finished answer.
+        if (record.status === "paused") {
+          return textResult(formatPausedForeground(record, ""), buildDetails(detailBaseFor(record), record));
+        }
+        // Same as the archived reopen: a segment that ran out of budget or was
+        // stopped says so, instead of handing back unmarked text.
         return textResult(
-          record.result?.trim() || "No output.",
+          (record.result?.trim() || "No output.") + getForegroundOutcomeNote(record.status),
           buildDetails(detailBaseFor(record), record),
         );
       }
@@ -2103,6 +2295,7 @@ Terse command-style prompts produce shallow, generic work.
           name: params.name as string | undefined,
           model,
           maxTurns: effectiveMaxTurns,
+          pauseTurns: effectivePauseTurns,
           isolated,
           inheritContext,
           thinkingLevel: thinking,
@@ -2258,6 +2451,7 @@ Terse command-style prompts produce shallow, generic work.
           name: params.name as string | undefined,
           model,
           maxTurns: effectiveMaxTurns,
+          pauseTurns: effectivePauseTurns,
           isolated,
           inheritContext,
           thinkingLevel: thinking,
@@ -2294,6 +2488,11 @@ Terse command-style prompts produce shallow, generic work.
       const tokenText = formatLifetimeTokens(record);
 
       const details = buildDetails(detailBaseFor(record), record, fgState, { tokens: tokenText });
+
+      // A checkpoint is not a result: partial output plus the id to continue it.
+      if (record.status === "paused") {
+        return textResult(formatPausedForeground(record, fallbackNote), details);
+      }
 
       if (record.status === "error") {
         // Error headline + any partial output the run produced before failing.
@@ -2839,6 +3038,11 @@ Terse command-style prompts produce shallow, generic work.
 
       if (record.status === "running") {
         output += "Agent is still running. Use wait: true or check back later.";
+      } else if (record.status === "paused") {
+        // A checkpoint must not read as a finished result.
+        output += `Agent is paused at a checkpoint — the task is unfinished and the agent will not continue on its own. ` +
+          `Resume it with the Agent tool (resume: "${record.id}") to continue, or treat the output below as its final answer.\n` +
+          (record.result?.trim() ? `\nPartial output at the checkpoint:\n${record.result.trim()}` : "No output yet.");
       } else if (record.status === "error") {
         output += `Error: ${record.error}${partialOutputSuffix(record)}`;
       } else {
@@ -2955,8 +3159,10 @@ Terse command-style prompts produce shallow, generic work.
     const agents = manager.listAgents().filter(isTopLevelAgent);
     if (agents.length > 0) {
       const running = agents.filter(a => a.status === "running" || a.status === "queued").length;
+      const paused = agents.filter(a => a.status === "paused").length;
       const done = agents.filter(a => a.status === "completed" || a.status === "steered").length;
-      options.push(`Running agents (${agents.length}) — ${running} running, ${done} done`);
+      // Paused is neither running nor done, so it gets its own count.
+      options.push(`Running agents (${agents.length}) — ${running} running${paused > 0 ? `, ${paused} paused` : ""}, ${done} done`);
     }
 
     // Agent types list

@@ -19,10 +19,11 @@ import { statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
+import { getGraceTurns, normalizeMaxTurns, resolveEffectiveMaxTurns, resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
 import { addGeneration } from "./generation.js";
 import { assignHandle, handleBase } from "./mention.js";
 import { describeModel } from "./model-resolver.js";
+import { normalizePauseTurns } from "./turn-checkpoint.js";
 import type { AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage, type LifetimeUsage } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
@@ -159,6 +160,18 @@ function occupiesForegroundSlot(
 /** Which concurrency pool a spawn is charged to, if any. */
 type Pool = "background" | "foreground";
 
+/**
+ * What `cleanupWorktree` needs, kept because the resume path has none of it:
+ * `resume()` gets an id and a prompt, not the `pi` handle or the base repo.
+ */
+interface RetainedWorktree {
+  pi: ExtensionAPI;
+  baseCwd: string;
+  /** Caller-supplied cwd, for the "in `repo`" note. Undefined = the parent's repo. */
+  customCwd?: string;
+  description: string;
+}
+
 interface SpawnArgs {
   pi: ExtensionAPI;
   ctx: ExtensionContext;
@@ -196,6 +209,17 @@ interface SpawnOptions {
   reclaim?: { handle: string; alias?: string };
   model?: Model<any>;
   maxTurns?: number;
+  /**
+   * Checkpoint interval: settle as "paused" after this many turns of this run.
+   * Undefined (the manager's default) = no checkpoints — a caller must ask.
+   */
+  pauseTurns?: number;
+  /**
+   * Turns already spent in the conversation this spawn reopens (a tombstone's
+   * total), so the reopened conversation's budget stays cumulative. Internal: the
+   * callers that reopen an archived conversation set it, nobody else.
+   */
+  turnOffset?: number;
   isolated?: boolean;
   inheritContext?: boolean;
   thinkingLevel?: ThinkingLevel;
@@ -313,6 +337,10 @@ interface ResumeOptions {
    * record — the historical behavior.
    */
   isBackground?: boolean;
+  /** Checkpoint interval for this segment and later ones. Omitted = inherit; 0 = off. */
+  pauseTurns?: number;
+  /** Cumulative turn ceiling for the whole conversation. Omitted = inherit; 0 = no ceiling. */
+  maxTurns?: number;
   /** Called on tool start/end with activity info (for streaming progress to UI). */
   onToolActivity?: (activity: ToolActivity) => void;
   /** Called once per assistant message_end with that message's usage delta. */
@@ -392,6 +420,9 @@ export class AgentManager {
    * completed records on session start/switch.
    */
   private tombstones = new Map<string, AgentTombstone>();
+
+  /** Worktrees a checkpoint is holding open, keyed by agent id. See RetainedWorktree. */
+  private pausedWorktrees = new Map<string, RetainedWorktree>();
 
   /**
    * Agents waiting to start, tagged with the pool they wait on. One queue for
@@ -501,6 +532,12 @@ export class AgentManager {
 
     const id = randomUUID().slice(0, 17);
     const abortController = new AbortController();
+    const pauseTurns = normalizePauseTurns(options.pauseTurns);
+    // A reopened conversation brings the turns it already spent, and is refused
+    // here if that is all of its budget — same rule as resume().
+    const baseTurns = options.turnOffset ?? 0;
+    const maxTurns = resolveEffectiveMaxTurns(type, options.maxTurns);
+    this.assertBudgetRemains(id, baseTurns, maxTurns);
     const record: AgentRecord = {
       id,
       type,
@@ -522,6 +559,12 @@ export class AgentManager {
       // since the pool decision needs the finished record.
       status: options.isBackground ? "queued" : "running",
       toolUses: 0,
+      pauseTurns,
+      // The whole conversation's budget: a resume inherits this ceiling (or
+      // overrides it) and is counted against the running total.
+      maxTurns,
+      // Only a reopened conversation has spent turns before its first one.
+      totalTurns: baseTurns > 0 ? baseTurns : undefined,
       startedAt: Date.now(),
       abortController,
       lifetimeUsage: { input: 0, output: 0, cacheWrite: 0, cost: 0 },
@@ -693,6 +736,9 @@ export class AgentManager {
     // every later blocking spawn queues forever). The two startup exits below
     // never reach `settleRun`, so they hand the slot back themselves.
     const pool = this.poolFor(record);
+    // A reopened conversation starts counting where its tombstone left off; a
+    // fresh spawn starts at 0.
+    const baseTurns = record.totalTurns ?? 0;
     const releaseSlot = () => {
       if (pool === "background") this.runningBackground--;
       else if (pool === "foreground") this.runningForeground--;
@@ -763,7 +809,13 @@ export class AgentManager {
       pi,
       agentId: id,
       model: options.model,
-      maxTurns: options.maxTurns,
+      // 0, not undefined: the runner re-resolves `undefined` against the agent's
+      // config and the project default, which would re-enable a ceiling this
+      // conversation was told to drop.
+      maxTurns: record.maxTurns ?? 0,
+      pauseTurns: record.pauseTurns,
+      // Always 0 for a fresh spawn; a reopened conversation counts from its offset.
+      turnOffset: baseTurns,
       isolated: options.isolated,
       inheritContext: options.inheritContext,
       thinkingLevel: options.thinkingLevel,
@@ -786,7 +838,13 @@ export class AgentManager {
         if (activity.type === "end") record.toolUses++;
         options.onToolActivity?.(activity);
       },
-      onTurnEnd: options.onTurnEnd,
+      onTurnEnd: (turnCount) => {
+        // A spawn is one segment, so the segment's count is what it adds to
+        // whatever the conversation already spent.
+        record.segmentTurns = turnCount;
+        record.totalTurns = baseTurns + turnCount;
+        options.onTurnEnd?.(turnCount);
+      },
       onTextDelta: options.onTextDelta,
       onGeneration: (stats) => { record.generation = addGeneration(record.generation, stats); },
       onAssistantUsage: (usage) => {
@@ -848,17 +906,21 @@ export class AgentManager {
         options.onSessionCreated?.(session);
       },
     })
-      .then(async ({ responseText, session, aborted, steered, failure, structuredJson, structuredRetried }) => {
+      .then(async ({ responseText, session, aborted, steered, failure, paused, structuredJson, structuredRetried }) => {
         // Don't overwrite status if externally stopped via abort()
         if (record.status !== "stopped") {
           // Precedence: a hard abort keeps "aborted"; then a failed final turn
           // (provider error that pi resolved instead of rejecting, #144) is an
           // honest "error" — not a completion with an empty or stale result.
+          // A checkpoint is not an ending: the segment yielded, and the caller
+          // decides what happens next.
           if (aborted) {
             record.status = "aborted";
           } else if (failure) {
             record.status = "error";
             record.error = failure;
+          } else if (paused) {
+            record.status = "paused";
           } else {
             record.status = steered ? "steered" : "completed";
           }
@@ -870,6 +932,7 @@ export class AgentManager {
         record.structuredJson = structuredJson;
         record.structuredRetried = structuredRetried;
         record.session = session;
+        // Marks the end of this segment, checkpoint or not.
         record.completedAt ??= Date.now();
 
         detach();
@@ -880,29 +943,23 @@ export class AgentManager {
           record.outputCleanup = undefined;
         }
 
-        // Clean up worktree if used
-        if (record.worktree) {
-          // The one moment the child's tree still exists and the child is done
-          // writing to it. try/catch, not decoration: a hook that throws must
-          // not leave the worktree behind.
-          if (options.onBeforeWorktreeCleanup) {
-            try {
-              await options.onBeforeWorktreeCleanup(record.worktree.path);
-            } catch { /* ignore — never block cleanup */ }
+        if (record.status === "paused") {
+          // Keep the copy: the next segment has to run in the same directory.
+          if (record.worktree) {
+            this.pausedWorktrees.set(id, { pi, baseCwd, customCwd, description: options.description });
           }
-          const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
-          record.worktreeResult = wtResult;
-          if (wtResult.hasChanges && wtResult.branch) {
-            // With a caller-supplied cwd the branch lives in THAT repo, not the
-            // parent session's — say so, or the orchestrator merges in the wrong repo.
-            const repoNote = customCwd !== undefined ? ` in \`${baseCwd}\`` : "";
-            // Appended to the prose only. A structured child's caller parses
-            // `structuredJson`, which stays untouched — but `result` is also
-            // what a human reads, so the note still belongs on it.
-            record.result = (record.result ?? "") +
-              `\n\n---\nChanges saved to branch \`${wtResult.branch}\`${repoNote}. Merge with: \`git merge ${wtResult.branch}\`${customCwd !== undefined ? ` (run in \`${baseCwd}\`)` : ""}`;
-          }
+          // Children stop with the segment; a resumed segment can start them again.
+          this.abortOwnedChildren(id);
+          this.settleRun(record, true, pool);
+          return responseText;
         }
+
+        // Clean up worktree if used
+        await this.removeWorktreeAfterRun(
+          record,
+          { pi, baseCwd, customCwd, description: options.description },
+          options.onBeforeWorktreeCleanup,
+        );
 
         this.abortOwnedChildren(id);
 
@@ -985,6 +1042,70 @@ export class AgentManager {
     // A drain with nothing freed is a no-op anyway, but "no-op" is a claim
     // about reachability, and matching the old condition needs no such claim.
     if (record.isBackground || pool !== undefined) this.drainQueue();
+  }
+
+  /**
+   * Commit-and-remove one worktree, then note the branch it produced on the
+   * record's result. The one place a run gives its copy back.
+   */
+  private async removeWorktreeAfterRun(
+    record: AgentRecord,
+    held: RetainedWorktree,
+    onBefore?: (worktreePath: string) => Promise<void>,
+  ): Promise<void> {
+    if (!record.worktree) return;
+    const { pi, baseCwd, customCwd } = held;
+    // The one moment the child's tree still exists and the child is done writing
+    // to it. try/catch, not decoration: a hook that throws must not leave the
+    // worktree behind.
+    if (onBefore) {
+      try { await onBefore(record.worktree.path); } catch { /* ignore — never block cleanup */ }
+    }
+    const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, held.description);
+    record.worktreeResult = wtResult;
+    if (wtResult.hasChanges && wtResult.branch) {
+      // With a caller-supplied cwd the branch lives in THAT repo, not the parent
+      // session's — say so, or the orchestrator merges in the wrong repo.
+      const repoNote = customCwd !== undefined ? ` in \`${baseCwd}\`` : "";
+      // Appended to the prose only. A structured child's caller parses
+      // `structuredJson`, which stays untouched — but `result` is also what a
+      // human reads, so the note still belongs on it.
+      record.result = (record.result ?? "") +
+        `\n\n---\nChanges saved to branch \`${wtResult.branch}\`${repoNote}. Merge with: \`git merge ${wtResult.branch}\`${customCwd !== undefined ? ` (run in \`${baseCwd}\`)` : ""}`;
+    }
+  }
+
+  /**
+   * Give back the worktree a checkpoint held open, once. No-op when there is none,
+   * or on a second call.
+   */
+  private async releaseRetainedWorktree(id: string, record: AgentRecord): Promise<void> {
+    const held = this.pausedWorktrees.get(id);
+    if (!held) return;
+    // Dropped before the (awaited) cleanup, so the idempotence does not depend on
+    // how long git takes.
+    this.pausedWorktrees.delete(id);
+    await this.removeWorktreeAfterRun(record, held);
+  }
+
+  /**
+   * Refuse a run whose conversation has nothing left to spend: `max_turns` +
+   * grace is the runner's own hard stop. A higher `maxTurns` continues it.
+   */
+  private assertBudgetRemains(id: string, spent: number, maxTurns: number | undefined): void {
+    if (maxTurns === undefined) return;
+    const grace = getGraceTurns();
+    if (spent < maxTurns + grace) return;
+    throw new Error(
+      `Agent ${id} has used its whole turn budget (${spent} turns against a ${maxTurns}-turn ceiling, plus ${grace} grace turns) — ` +
+      `raise max_turns to continue this conversation, or start a new agent instead.`,
+    );
+  }
+
+  /** Fold a segment's turn count into the conversation's running total. */
+  private recordSegmentTurns(record: AgentRecord, baseTurns: number, segmentTurns: number): void {
+    record.segmentTurns = segmentTurns;
+    record.totalTurns = baseTurns + segmentTurns;
   }
 
   /**
@@ -1115,6 +1236,29 @@ export class AgentManager {
     const record = this.agents.get(id);
     if (!record?.session) return undefined;
 
+    // Never re-enter a run that is still in flight — in either mode. A detached
+    // resume hands control back while the record stays "running", so nothing stops
+    // the model from resuming the same agent again. A second run would overwrite
+    // record.abortController — orphaning the live run beyond the reach of `/agents`
+    // stop and abortAll() — double-count the pool slot, and then reject from
+    // session.prompt() with "Agent is already processing", whose settle path would
+    // abort the LIVE run's children and report a failure for a run still going.
+    // Refuse instead, leaving the record untouched; the caller decides what next.
+    if (record.status === "running" || record.status === "queued") return undefined;
+
+    // An explicit interval (including 0, which turns checkpoints off) wins;
+    // otherwise the conversation keeps what it had.
+    const pauseTurns = options?.pauseTurns !== undefined
+      ? normalizePauseTurns(options.pauseTurns)
+      : record.pauseTurns;
+    // An explicit ceiling wins (0 clears it, like the runner). Otherwise the value
+    // resolved once at spawn stands: resolving it again would re-apply a project
+    // default that has changed since the record was created.
+    const requestedMaxTurns = options?.maxTurns;
+    const maxTurns = requestedMaxTurns === undefined
+      ? record.maxTurns
+      : normalizeMaxTurns(requestedMaxTurns);
+
     // Background resume: settle asynchronously and notify on completion exactly
     // like a background spawn, returning immediately with the record still
     // "running" — or "queued" when at the concurrency limit. Previously
@@ -1122,16 +1266,11 @@ export class AgentManager {
     // returned before its background branch, and resume() only ever awaited
     // inline), so a resumed agent always blocked the caller until it finished.
     if (options?.isBackground) {
-      // Never re-enter a run that is still in flight. Detaching means the caller
-      // gets control back while the record stays "running", so nothing stops the
-      // model from resuming the same agent again. Starting a second run would
-      // overwrite record.abortController — orphaning the live run beyond the
-      // reach of `/agents` stop and abortAll() — double-count the pool slot, and
-      // then reject from session.prompt() with "Agent is already processing",
-      // whose settle path would abort the LIVE run's children and report a
-      // failure for a run that is still going. Refuse instead, leaving the
-      // record untouched; the caller decides whether to wait or steer.
-      if (record.status === "running" || record.status === "queued") return undefined;
+      this.assertBudgetRemains(record.id, record.totalTurns ?? 0, maxTurns);
+
+      // Later segments inherit both; the paused surfaces read them off the record.
+      record.pauseTurns = pauseTurns;
+      record.maxTurns = maxTurns;
 
       record.isBackground = true;
       record.resultConsumed = false;
@@ -1169,14 +1308,40 @@ export class AgentManager {
     }
 
     // Foreground resume: run inline and return the settled record.
+    this.assertBudgetRemains(record.id, record.totalTurns ?? 0, maxTurns);
+    // The caller's own signal (user Esc) was already spent before the run began:
+    // an aborted signal never fires a listener, so stop here instead of starting a
+    // run nobody is waiting for.
+    if (signal?.aborted) {
+      this.abort(id);
+      return record;
+    }
+    record.pauseTurns = pauseTurns;
+    record.maxTurns = maxTurns;
     record.status = "running";
     record.startedAt = Date.now();
     record.completedAt = undefined;
     record.result = undefined;
     record.error = undefined;
 
+    // Fresh controller, like the background path: a stop from the viewer or the
+    // RPC layer has to reach THIS run, not the settled one before it.
+    const abortController = new AbortController();
+    record.abortController = abortController;
+    // The caller's own signal (user Esc) routes into abort(), which aborts this
+    // run's controller rather than the settled one before it.
+    let detachParentSignal: (() => void) | undefined;
+    if (signal) {
+      const onParentAbort = () => this.abort(id);
+      signal.addEventListener("abort", onParentAbort, { once: true });
+      detachParentSignal = () => signal.removeEventListener("abort", onParentAbort);
+    }
+
+    // Turns already spent before this segment, for the cumulative ceiling.
+    const baseTurns = record.totalTurns ?? 0;
+
     try {
-      const { text, failure } = await resumeAgent(record.session, prompt, {
+      const { text, failure, paused, aborted, steered } = await resumeAgent(record.session, prompt, {
         onGeneration: (stats) => { record.generation = addGeneration(record.generation, stats); },
         onToolActivity: (activity) => {
           if (activity.type === "end") record.toolUses++;
@@ -1192,22 +1357,37 @@ export class AgentManager {
           this.onCompact?.(record, info);
           options?.onCompaction?.(info);
         },
-        signal,
+        pauseTurns: record.pauseTurns,
+        maxTurns: record.maxTurns,
+        turnOffset: baseTurns,
+        onTurnEnd: (segmentTurns) => this.recordSegmentTurns(record, baseTurns, segmentTurns),
+        signal: abortController.signal,
       });
       // Same contract as the spawn path (#144): a failed final turn is an
-      // error, not a completion — but the resumed text stays available.
-      record.status = failure ? "error" : "completed";
-      if (failure) record.error = failure;
+      // error, not a completion — but the resumed text stays available. A stop
+      // that landed mid-run aborted this run's controller and wins over all of it.
+      if (!abortController.signal.aborted) {
+        if (aborted) record.status = "aborted";
+        else if (failure) { record.status = "error"; record.error = failure; }
+        else if (paused) record.status = "paused";
+        else record.status = steered ? "steered" : "completed";
+      }
       record.result = text;
+      // Marks the end of this segment, checkpoint or not.
       record.completedAt = Date.now();
     } catch (err) {
-      record.status = "error";
-      record.error = err instanceof Error ? err.message : String(err);
+      if (!abortController.signal.aborted) {
+        record.status = "error";
+        record.error = err instanceof Error ? err.message : String(err);
+      }
       record.completedAt = Date.now();
+    } finally {
+      detachParentSignal?.();
     }
 
-    // Same contract as the spawn settle paths: children spawned during the
-    // resumed turn must not outlive it — nothing else can see or reach them.
+    // Only an ending gives the worktree back. Children never outlive a segment —
+    // a resumed segment can start them again.
+    if (record.status !== "paused") await this.releaseRetainedWorktree(id, record);
     this.abortOwnedChildren(id);
 
     return record;
@@ -1253,6 +1433,9 @@ export class AgentManager {
     // After the record is in its running shape, before the run is kicked off.
     try { options.onStarted?.(); } catch { /* ignore caller wiring errors */ }
 
+    // Turns already spent before this segment — see resume().
+    const baseTurns = record.totalTurns ?? 0;
+
     const settle = () => {
       detachParentSignal?.();
       detachParentSignal = undefined;
@@ -1261,7 +1444,8 @@ export class AgentManager {
         try { record.outputCleanup(); } catch { /* ignore */ }
         record.outputCleanup = undefined;
       }
-      // Children spawned during the resumed turn must not outlive it.
+      // A checkpoint settles like any other segment: frees the slot, stops its
+      // children, and notifies through this callback so the parent hears about it.
       this.abortOwnedChildren(id);
       if (occupiesPoolSlot(record)) this.runningBackground--;
       try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
@@ -1284,27 +1468,37 @@ export class AgentManager {
         this.onCompact?.(record, info);
         options.onCompaction?.(info);
       },
+      pauseTurns: record.pauseTurns,
+      maxTurns: record.maxTurns,
+      turnOffset: baseTurns,
+      onTurnEnd: (segmentTurns) => this.recordSegmentTurns(record, baseTurns, segmentTurns),
       signal: abortController.signal,
     })
-      .then(({ text, failure }) => {
+      .then(async ({ text, failure, paused, aborted, steered }) => {
         // Don't overwrite status if externally stopped via abort().
         if (record.status !== "stopped") {
           // Same contract as the spawn path (#144): a failed final turn is an
           // error, not a completion — but the resumed text stays available.
-          record.status = failure ? "error" : "completed";
-          if (failure) record.error = failure;
+          if (aborted) record.status = "aborted";
+          else if (failure) { record.status = "error"; record.error = failure; }
+          else if (paused) record.status = "paused";
+          else record.status = steered ? "steered" : "completed";
         }
         record.result = text;
+        // Marks the end of this segment, checkpoint or not.
         record.completedAt ??= Date.now();
+        // A checkpoint keeps its worktree; an ending gives it back.
+        if (record.status !== "paused") await this.releaseRetainedWorktree(id, record);
         settle();
         return text;
       })
-      .catch((err) => {
+      .catch(async (err) => {
         if (record.status !== "stopped") {
           record.status = "error";
           record.error = err instanceof Error ? err.message : String(err);
         }
         record.completedAt ??= Date.now();
+        await this.releaseRetainedWorktree(id, record);
         settle();
         return "";
       });
@@ -1422,6 +1616,18 @@ export class AgentManager {
       return true;
     }
 
+    // A paused agent has no run to abort, but it does hold a session and (with
+    // worktree isolation) a copy: stopping it gives up both. No `onComplete` — the
+    // checkpoint already notified for this segment.
+    if (record.status === "paused") {
+      record.status = "stopped";
+      record.completedAt = Date.now();
+      // Detached: abort() is synchronous and its callers are interrupt paths.
+      void this.releaseRetainedWorktree(id, record).catch(() => {});
+      this.abortOwnedChildren(id);
+      return true;
+    }
+
     if (record.status !== "running") return false;
     record.abortController?.abort();
     record.status = "stopped";
@@ -1461,6 +1667,11 @@ export class AgentManager {
       type: record.type,
       description: record.description,
       sessionFile: record.sessionFile,
+      // The budget goes with the conversation, not the record: a `@handle`
+      // reopened in this session must not get a fresh allowance.
+      pauseTurns: record.pauseTurns,
+      totalTurns: record.totalTurns,
+      maxTurns: record.maxTurns,
       completedAt: record.completedAt ?? Date.now(),
     });
     // Bound the memory a long session can accumulate. Oldest first, since the
@@ -1474,10 +1685,19 @@ export class AgentManager {
   private cleanup() {
     const cutoff = Date.now() - 10 * 60_000;
     for (const [id, record] of this.agents) {
-      if (record.status === "running" || record.status === "queued") continue;
+      if (!this.isFinished(record)) continue;
       if ((record.completedAt ?? 0) >= cutoff) continue;
       this.removeRecord(id, record);
     }
+  }
+
+  /**
+   * Whether a record has finished, in the sense both sweeps care about. A
+   * checkpoint has not: evicting it would dispose a session and a worktree the
+   * next segment needs. Not what `hasRunning()` reports (docs/rpc.md).
+   */
+  private isFinished(record: Pick<AgentRecord, "status">): boolean {
+    return record.status !== "running" && record.status !== "queued" && record.status !== "paused";
   }
 
   /**
@@ -1488,7 +1708,7 @@ export class AgentManager {
    */
   clearCompleted(skipUnconsumed = false): void {
     for (const [id, record] of this.agents) {
-      if (record.status === "running" || record.status === "queued") continue;
+      if (!this.isFinished(record)) continue;
       if (skipUnconsumed && !record.resultConsumed) continue;
       this.removeRecord(id, record);
     }
@@ -1563,6 +1783,11 @@ export class AgentManager {
     // Clear queue — via dequeue, so anyone blocked in spawnAndWait is woken
     // rather than left awaiting a gate nothing will ever resolve.
     this.dequeue(() => true);
+    // A checkpoint still holds its worktree, and nothing can resume it once the
+    // process is gone. Detached, like the prune below: shutdown cannot wait for git.
+    for (const [id, record] of this.agents) {
+      void this.releaseRetainedWorktree(id, record).catch(() => {});
+    }
     const sessions = [...this.agents.values()].map(record => record.session);
     this.agents.clear();
     this.startups.clear();

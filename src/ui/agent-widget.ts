@@ -25,6 +25,15 @@ export const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", 
 /** Statuses that indicate an error/non-success outcome (used for linger behavior and icon rendering). */
 export const ERROR_STATUSES = new Set(["error", "aborted", "steered", "stopped"]);
 
+/**
+ * The paused status: a checkpoint stopped the run mid-task, held open until the
+ * parent decides. Not an error, and not aged out with finished rows — the record
+ * is still live. Takes a plain string because the render paths see one.
+ */
+export function isPausedStatus(status: string): boolean {
+  return status === "paused";
+}
+
 /** Tool name → human-readable action for activity descriptions. */
 const TOOL_DISPLAY: Record<string, string> = {
   read: "reading",
@@ -422,8 +431,12 @@ export class AgentWidget {
     return theme.fg("dim", renderWidgetStatusTemplate(template, vars));
   }
 
-  /** Render a finished agent line. */
-  private renderFinishedLine(a: { id: string; type: SubagentType; status: string; description: string; toolUses: number; startedAt: number; completedAt?: number; error?: string; lifetimeUsage?: LifetimeUsage; invocation?: AgentInvocation; generation?: GenerationStats }, theme: Theme): string {
+  /**
+   * One-line summary row for a run that is not running: every settled status plus
+   * `paused`. A paused row shows no ✓ or ✗ — it is neither — and takes its turn
+   * count from the record, since the activity tracker entry is gone by then.
+   */
+  private renderSummaryLine(a: { id: string; type: SubagentType; status: string; description: string; toolUses: number; startedAt: number; completedAt?: number; error?: string; segmentTurns?: number; totalTurns?: number; maxTurns?: number; lifetimeUsage?: LifetimeUsage; invocation?: AgentInvocation; generation?: GenerationStats }, theme: Theme): string {
     const modeLabel = getPromptModeLabel(a.type);
     const duration = formatMs((a.completedAt ?? Date.now()) - a.startedAt);
 
@@ -438,6 +451,10 @@ export class AgentWidget {
     } else if (a.status === "stopped") {
       icon = theme.fg("dim", "■");
       statusText = theme.fg("dim", " stopped");
+    } else if (isPausedStatus(a.status)) {
+      // Warning, not success/error: the run is held, not decided.
+      icon = theme.fg("warning", "‖");
+      statusText = theme.fg("warning", " paused");
     } else if (a.status === "error") {
       icon = theme.fg("error", "✗");
       const errMsg = a.error ? `: ${a.error.slice(0, 60)}` : "";
@@ -456,7 +473,14 @@ export class AgentWidget {
     const thinkingTag = tags.find(tag => tag.startsWith("thinking: "));
     if (thinkingTag) parts.push(thinkingTag);
     const activity = this.agentActivity.get(a.id);
-    if (activity) parts.push(formatTurns(activity.turnCount, activity.maxTurns));
+    // A paused row reads cumulative turns from the record: its tracker entry is
+    // gone, and a pause does not reset the count. A settled row reads the tracker
+    // while it is still around, and shows nothing once it is not.
+    const pausedTurns = a.totalTurns ?? a.segmentTurns;
+    const turnsText = isPausedStatus(a.status)
+      ? (pausedTurns != null ? formatTurns(pausedTurns, a.maxTurns) : "")
+      : activity ? formatTurns(activity.turnCount, activity.maxTurns) : "";
+    if (turnsText) parts.push(turnsText);
     if (a.toolUses > 0) parts.push(`${a.toolUses} tool use${a.toolUses === 1 ? "" : "s"}`);
     // From the record, not the activity tracker: that entry is deleted the
     // moment an agent finishes, and "what did it cost" is a question asked
@@ -469,8 +493,8 @@ export class AgentWidget {
 
     const modeTag = modeLabel ? ` ${theme.fg("dim", `(${modeLabel})`)}` : "";
     const fallback = `${theme.fg("dim", a.description)} ${theme.fg("dim", "·")} ${theme.fg("dim", parts.join(" · "))}`;
-    // A finished record carries no turn count of its own; `${round}` reads the
-    // live tracker and is empty once that entry is gone — never fabricated.
+    // `${round}` mirrors the body: the record's cumulative turns for a paused
+    // run, the live tracker otherwise (empty once that entry is gone).
     const body = this.statusBody(
       theme,
       {
@@ -478,7 +502,7 @@ export class AgentWidget {
         model: modelName ?? "",
         model_id: modelId ?? "",
         effort: thinkingTag ? thinkingTag.slice("thinking: ".length) : "",
-        round: activity ? formatTurns(activity.turnCount, activity.maxTurns) : "",
+        round: turnsText,
         tool_uses_count: String(a.toolUses),
         total_token: formatTokens(getLifetimeTotal(a.lifetimeUsage)),
         tps: formatGenerationTpsValue(a.generation),
@@ -499,12 +523,14 @@ export class AgentWidget {
     const allAgents = this.widgetAgents();
     const running = allAgents.filter(a => a.status === "running");
     const queued = allAgents.filter(a => a.status === "queued");
+    // Never aged out with the finished ones: a paused record is retained.
+    const paused = allAgents.filter(a => isPausedStatus(a.status));
     const finished = allAgents.filter(a =>
-      a.status !== "running" && a.status !== "queued" && a.completedAt
+      a.status !== "running" && a.status !== "queued" && !isPausedStatus(a.status) && a.completedAt
       && this.shouldShowFinished(a.id, a.status),
     );
 
-    const hasActive = running.length > 0 || queued.length > 0;
+    const hasActive = running.length > 0 || queued.length > 0 || paused.length > 0;
     const hasFinished = finished.length > 0;
 
     // Nothing to show — return empty (widget will be unregistered by update())
@@ -517,11 +543,16 @@ export class AgentWidget {
     const frame = SPINNER[this.widgetFrame % SPINNER.length];
 
     // Build sections separately for overflow-aware assembly.
-    // Each running agent = 2 lines (header + activity), finished = 1 line, queued = 1 line.
+    // Each running agent = 2 lines (header + activity), finished/paused = 1 line, queued = 1 line.
 
     const finishedLines: string[] = [];
     for (const a of finished) {
-      finishedLines.push(truncate(theme.fg("dim", "├─") + " " + this.renderFinishedLine(a, theme)));
+      finishedLines.push(truncate(theme.fg("dim", "├─") + " " + this.renderSummaryLine(a, theme)));
+    }
+
+    const pausedLines: string[] = [];
+    for (const a of paused) {
+      pausedLines.push(truncate(theme.fg("dim", "├─") + " " + this.renderSummaryLine(a, theme)));
     }
 
     const runningLines: string[][] = []; // each entry is [header, activity]
@@ -593,12 +624,14 @@ export class AgentWidget {
 
     // Assemble with overflow cap (heading + overflow indicator = 2 reserved lines).
     const maxBody = MAX_WIDGET_LINES - 1; // heading takes 1 line
-    const totalBody = finishedLines.length + runningLines.length * 2 + (queuedLine ? 1 : 0);
+    const totalBody = pausedLines.length + finishedLines.length + runningLines.length * 2 + (queuedLine ? 1 : 0);
 
     const lines: string[] = [truncate(theme.fg(headingColor, headingIcon) + " " + theme.fg(headingColor, "Agents"))];
 
     if (totalBody <= maxBody) {
       // Everything fits — add all lines and fix up connectors for the last item.
+      // Paused rows lead: their record is still live.
+      lines.push(...pausedLines);
       lines.push(...finishedLines);
       for (const pair of runningLines) lines.push(...pair);
       if (queuedLine) lines.push(queuedLine);
@@ -618,10 +651,11 @@ export class AgentWidget {
         }
       }
     } else {
-      // Overflow — prioritize: running > queued > finished.
+      // Overflow — prioritize: running > queued > paused > finished.
       // Reserve 1 line for overflow indicator.
       let budget = maxBody - 1;
       let hiddenRunning = 0;
+      let hiddenPaused = 0;
       let hiddenFinished = 0;
 
       // Reserve the queued line's row up front. It is a single summary of N
@@ -651,7 +685,18 @@ export class AgentWidget {
         budget--;
       }
 
-      // 3. Finished agents
+      // 3. Paused agents (1 line each) — ahead of finished ones: a held run is
+      // still waiting on a decision, a finished one has already been reported.
+      for (const pl of pausedLines) {
+        if (budget >= 1) {
+          lines.push(pl);
+          budget--;
+        } else {
+          hiddenPaused++;
+        }
+      }
+
+      // 4. Finished agents
       for (const fl of finishedLines) {
         if (budget >= 1) {
           lines.push(fl);
@@ -664,9 +709,10 @@ export class AgentWidget {
       // Overflow summary
       const overflowParts: string[] = [];
       if (hiddenRunning > 0) overflowParts.push(`${hiddenRunning} running`);
+      if (hiddenPaused > 0) overflowParts.push(`${hiddenPaused} paused`);
       if (hiddenFinished > 0) overflowParts.push(`${hiddenFinished} finished`);
       const overflowText = overflowParts.join(", ");
-      lines.push(truncate(theme.fg("dim", "└─") + ` ${theme.fg("dim", `+${hiddenRunning + hiddenFinished} more (${overflowText})`)}`)
+      lines.push(truncate(theme.fg("dim", "└─") + ` ${theme.fg("dim", `+${hiddenRunning + hiddenPaused + hiddenFinished} more (${overflowText})`)}`)
       );
     }
 
@@ -681,13 +727,16 @@ export class AgentWidget {
     // Lightweight existence checks — full categorization happens in renderWidget()
     let runningCount = 0;
     let queuedCount = 0;
+    let pausedCount = 0;
     let hasFinished = false;
     for (const a of allAgents) {
       if (a.status === "running") { runningCount++; }
       else if (a.status === "queued") { queuedCount++; }
+      // Before the finished case: a paused record may carry a completedAt.
+      else if (isPausedStatus(a.status)) { pausedCount++; }
       else if (a.completedAt && this.shouldShowFinished(a.id, a.status)) { hasFinished = true; }
     }
-    const hasActive = runningCount > 0 || queuedCount > 0;
+    const hasActive = runningCount > 0 || queuedCount > 0 || pausedCount > 0;
 
     // Nothing to show — clear widget
     if (!hasActive && !hasFinished) {
@@ -714,7 +763,8 @@ export class AgentWidget {
       const statusParts: string[] = [];
       if (runningCount > 0) statusParts.push(`${runningCount} running`);
       if (queuedCount > 0) statusParts.push(`${queuedCount} queued`);
-      const total = runningCount + queuedCount;
+      if (pausedCount > 0) statusParts.push(`${pausedCount} paused`);
+      const total = runningCount + queuedCount + pausedCount;
       newStatusText = `${statusParts.join(", ")} agent${total === 1 ? "" : "s"}`;
     }
     if (newStatusText !== this.lastStatusText) {

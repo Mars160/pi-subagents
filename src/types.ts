@@ -143,6 +143,14 @@ export interface AgentTombstone {
   description: string;
   /** Always set — a record with no session file is never tombstoned. */
   sessionFile: string;
+  /**
+   * The conversation's checkpoint interval and turn budget, carried over from the
+   * evicted record: reopening it continues against what it already spent instead of
+   * starting with a fresh allowance. Undefined = the record had none.
+   */
+  pauseTurns?: number;
+  totalTurns?: number;
+  maxTurns?: number;
   completedAt: number;
 }
 
@@ -172,10 +180,26 @@ export interface AgentRecord {
    */
   alias?: string;
   description: string;
-  status: "queued" | "running" | "completed" | "steered" | "aborted" | "stopped" | "error";
+  status: "queued" | "running" | "paused" | "completed" | "steered" | "aborted" | "stopped" | "error";
   result?: string;
   error?: string;
   toolUses: number;
+  /**
+   * Checkpoint interval: the run settles as "paused" after this many turns of a
+   * segment. Undefined = no checkpoints (the manager's default); a resume passing
+   * `pauseTurns: 0` clears it.
+   */
+  pauseTurns?: number;
+  /** Turns this conversation has used in total, across every segment (never resets). */
+  totalTurns?: number;
+  /** Turns used by the run that just settled — what `pauseTurns` bounds. */
+  segmentTurns?: number;
+  /**
+   * The conversation's cumulative turn ceiling, resolved at spawn and inherited by
+   * every later run: it bounds the WHOLE conversation, not one segment. Undefined =
+   * unlimited; `ResumeOptions.maxTurns` overrides it.
+   */
+  maxTurns?: number;
   startedAt: number;
   completedAt?: number;
   session?: AgentSession;
@@ -301,6 +325,8 @@ export interface AgentInvocation {
   /** The caller's `model` parameter, as written, when an agent file's pin won. */
   requestedModel?: string;
   maxTurns?: number;
+  /** Checkpoint interval this call asked for — the effective one, defaults included. */
+  pauseTurns?: number;
   isolated?: boolean;
   inheritContext?: boolean;
   runInBackground?: boolean;

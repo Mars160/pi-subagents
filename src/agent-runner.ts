@@ -36,6 +36,7 @@ import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
 import { createStructuredCapture, createStructuredOutputTool, structuredRetryPrompt } from "./structured-output.js";
+import { installTurnCheckpoint, normalizePauseTurns } from "./turn-checkpoint.js";
 import type { SubagentType, ThinkingLevel } from "./types.js";
 import type { LifetimeUsage } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
@@ -326,7 +327,13 @@ export function normalizeMaxTurns(n: number | undefined): number | undefined {
   return Math.max(1, n);
 }
 
-/** Get the default max turns value. undefined = unlimited. */
+/** Steering message sent to an agent that has reached its turn limit. */
+const TURN_LIMIT_MESSAGE =
+  "You have reached your turn limit. Wrap up immediately — provide your final answer now.";
+
+/**
+ * Get the default max turns value. undefined = unlimited.
+ */
 export function getDefaultMaxTurns(): number | undefined { return defaultMaxTurns; }
 /** Set the default max turns value. undefined or 0 = unlimited, otherwise minimum 1. */
 export function setDefaultMaxTurns(n: number | undefined): void { defaultMaxTurns = normalizeMaxTurns(n); }
@@ -433,6 +440,20 @@ export interface RunOptions {
   agentId?: string;
   model?: Model<any>;
   maxTurns?: number;
+  /**
+   * Stop this run at a turn boundary once it has completed this many turns,
+   * leaving the session resumable via {@link resumeAgent} (`RunResult.paused`
+   * says whether it happened). `0`/undefined disables it. Independent of
+   * `maxTurns`, which steers and eventually aborts rather than pausing.
+   */
+  pauseTurns?: number;
+  /**
+   * Turns already spent by earlier segments of this same agent. `maxTurns` is
+   * enforced against `turnOffset + <turns this run>` while `onTurnEnd` still
+   * reports the turns of this run alone, so resuming an agent cannot hand it a
+   * fresh budget.
+   */
+  turnOffset?: number;
   signal?: AbortSignal;
   isolated?: boolean;
   inheritContext?: boolean;
@@ -533,6 +554,12 @@ export interface RunResult {
   aborted: boolean;
   /** True if the agent was steered to wrap up (hit soft turn limit) but finished in time. */
   steered: boolean;
+  /**
+   * True if the run stopped at a turn checkpoint (`pauseTurns`) rather than
+   * finishing. The session is left resumable; no failure is reported for the
+   * partial segment, and the structured-output retry is skipped.
+   */
+  paused?: boolean;
   /**
    * A failure message for the run's FINAL assistant turn, when that turn failed:
    * a provider error (stopReason "error"), or a "length" stop that produced no
@@ -1128,9 +1155,12 @@ export async function runAgent(
 
   options.onSessionCreated?.(session);
 
-  // Track turns for graceful max_turns enforcement
+  // Track turns for graceful max_turns enforcement. `turnOffset` carries turns
+  // this agent already spent in earlier segments (a resumed agent), so the cap
+  // is on the agent's lifetime rather than on each segment of it.
   let turnCount = 0;
   const maxTurns = resolveEffectiveMaxTurns(type, options.maxTurns);
+  const turnOffset = options.turnOffset ?? 0;
   let softLimitReached = false;
   let aborted = false;
 
@@ -1140,10 +1170,11 @@ export async function runAgent(
       turnCount++;
       options.onTurnEnd?.(turnCount);
       if (maxTurns != null) {
-        if (!softLimitReached && turnCount >= maxTurns) {
+        const totalTurns = turnOffset + turnCount;
+        if (!softLimitReached && totalTurns >= maxTurns) {
           softLimitReached = true;
-          session.steer("You have reached your turn limit. Wrap up immediately — provide your final answer now.");
-        } else if (softLimitReached && turnCount >= maxTurns + graceTurns) {
+          session.steer(TURN_LIMIT_MESSAGE);
+        } else if (softLimitReached && totalTurns >= maxTurns + graceTurns) {
           aborted = true;
           session.abort();
         }
@@ -1178,6 +1209,23 @@ export async function runAgent(
   });
 
   const collector = collectResponseText(session);
+  // Installed before the prompt and restored in the `finally` below: the pause
+  // has to be able to stop the SDK's loop (and its post-run continuation) while
+  // the caller's own bookkeeping is still live. No-op unless pauseTurns asks
+  // for it, so nothing about a run without pausing changes.
+  const pauseTurns = normalizePauseTurns(options.pauseTurns);
+  const checkpoint = pauseTurns !== undefined
+    ? installTurnCheckpoint(session, {
+        pauseTurns,
+        // The runner's counter, not the hook's: `turn_end` also fires for turns
+        // that end in a provider error, which never reach the hook, so the pause
+        // lands on the same turn `maxTurns` counts.
+        getTurnCount: () => turnCount,
+        // max_turns wins over pausing: an agent already told to wrap up must not
+        // be stopped at a checkpoint as well, or the wrap-up never finishes.
+        shouldPause: () => maxTurns == null || turnOffset + turnCount < maxTurns,
+      })
+    : undefined;
   const cleanupGeneration = options.onGeneration ? subscribeGeneration(session, options.onGeneration) : () => {};
   const cleanupAbort = forwardAbortSignal(session, options.signal);
 
@@ -1195,6 +1243,14 @@ export async function runAgent(
   const startLen = session.messages.length;
   let structuredRetried = false;
   try {
+    // A segment starting with its budget already spent would otherwise get a free
+    // turn: the listener below can only latch the soft limit on the turn that
+    // reaches it, so the abort branch stays unreachable until the turn after.
+    // Latch and steer up front so the very first turn_end can abort.
+    if (maxTurns != null && turnOffset >= maxTurns) {
+      softLimitReached = true;
+      await session.steer(TURN_LIMIT_MESSAGE);
+    }
     await session.prompt(effectivePrompt);
 
     // One more prompt when a schema was asked for and nothing usable came back
@@ -1203,11 +1259,12 @@ export async function runAgent(
     // the abort forwarding are still live: torn down first, a retry would be
     // unkillable.
     if (structuredCapture !== undefined && structuredCapture.json === undefined
-      && !aborted && options.signal?.aborted !== true) {
+      && !aborted && !checkpoint?.paused && options.signal?.aborted !== true) {
       structuredRetried = true;
       await session.prompt(structuredRetryPrompt(structuredCapture));
     }
   } finally {
+    checkpoint?.restore();
     unsubTurns();
     cleanupGeneration();
     collector.unsubscribe();
@@ -1215,10 +1272,14 @@ export async function runAgent(
   }
 
   const responseText = collector.getText().trim() || getLastAssistantText(session, startLen);
+  // A paused segment is not a finished run: the model was not given the chance
+  // to answer, so neither a truncated final turn nor a missing StructuredOutput
+  // payload is a failure here — the caller resumes instead.
+  const paused = checkpoint?.paused ?? false;
   // A child asked for structured output that never gave any has failed, however
   // articulate its prose was. Reported through `failure` so it travels the same
   // path as a provider error rather than arriving as a successful empty answer.
-  const structuredFailure = structuredCapture !== undefined && structuredCapture.json === undefined
+  const structuredFailure = !paused && structuredCapture !== undefined && structuredCapture.json === undefined
     ? structuredCapture.lastError !== undefined
       ? `The agent's StructuredOutput call did not match the required schema: ${structuredCapture.lastError}`
       : "The agent did not report its answer through StructuredOutput."
@@ -1228,7 +1289,8 @@ export async function runAgent(
     session,
     aborted,
     steered: softLimitReached,
-    failure: finalTurnError(session, startLen) ?? structuredFailure,
+    failure: paused ? undefined : (finalTurnError(session, startLen) ?? structuredFailure),
+    ...(paused ? { paused } : {}),
     ...(structuredCapture?.json !== undefined ? { structuredJson: structuredCapture.json } : {}),
     ...(structuredRetried ? { structuredRetried } : {}),
   };
@@ -1236,6 +1298,11 @@ export async function runAgent(
 
 /**
  * Send a new prompt to an existing session (resume).
+ *
+ * The same turn machinery as {@link runAgent} applies: `maxTurns` steers then
+ * aborts (against `turnOffset + <turns this segment>`, so a resumed agent keeps
+ * the budget it already spent), and `pauseTurns` stops at a turn boundary and
+ * reports `paused` with the session left resumable again.
  */
 export async function resumeAgent(
   session: AgentSession,
@@ -1246,8 +1313,16 @@ export async function resumeAgent(
     onGeneration?: (stats: GenerationStats) => void;
     onCompaction?: (info: { reason: "manual" | "threshold" | "overflow"; tokensBefore: number }) => void;
     signal?: AbortSignal;
+    /** Turns this segment may run before pausing. `0`/undefined disables it. */
+    pauseTurns?: number;
+    /** Turn cap for the agent's lifetime. `0`/undefined means unlimited. */
+    maxTurns?: number;
+    /** Turns earlier segments of this agent already spent. */
+    turnOffset?: number;
+    /** Called at the end of each turn of THIS segment with this segment's count. */
+    onTurnEnd?: (turnCount: number) => void;
   } = {},
-): Promise<{ text: string; failure?: string }> {
+): Promise<{ text: string; failure?: string; paused?: boolean; aborted?: boolean; steered?: boolean }> {
   // A resume re-prompts a session that already exists, so nothing re-resolved
   // its model — `forceDefaultModel` would otherwise apply only to agents started
   // after it was turned on. Switch this child's own active model and record the
@@ -1275,11 +1350,47 @@ export async function resumeAgent(
   // — a failed resume must not surface the previous turn's answer (#144).
   const startLen = session.messages.length;
   const collector = collectResponseText(session);
+
+  // Same turn accounting as runAgent, for the same reason: a resume is just
+  // another segment of the same agent, and an agent resumed in a loop must not
+  // be handed a fresh budget (or a fresh pause interval) every time.
+  let turnCount = 0;
+  let softLimitReached = false;
+  let aborted = false;
+  const maxTurns = normalizeMaxTurns(options.maxTurns);
+  const turnOffset = options.turnOffset ?? 0;
+  const pauseTurns = normalizePauseTurns(options.pauseTurns);
+  const checkpoint = pauseTurns !== undefined
+    ? installTurnCheckpoint(session, {
+        pauseTurns,
+        getTurnCount: () => turnCount,
+        shouldPause: () => maxTurns == null || turnOffset + turnCount < maxTurns,
+      })
+    : undefined;
+
   const cleanupGeneration = options.onGeneration ? subscribeGeneration(session, options.onGeneration) : () => {};
   const cleanupAbort = forwardAbortSignal(session, options.signal);
 
-  const unsubEvents = (options.onToolActivity || options.onAssistantUsage || options.onCompaction)
+  // A checkpoint reads the counter below, so the subscription has to exist
+  // whenever one is installed — not only when the caller asked for a cap or a
+  // counter of its own.
+  const wantsTurnEvents = maxTurns != null || pauseTurns !== undefined || options.onTurnEnd !== undefined;
+  const unsubEvents = (wantsTurnEvents || options.onToolActivity || options.onAssistantUsage || options.onCompaction)
     ? session.subscribe((event: AgentSessionEvent) => {
+        if (event.type === "turn_end") {
+          turnCount++;
+          options.onTurnEnd?.(turnCount);
+          if (maxTurns != null) {
+            const totalTurns = turnOffset + turnCount;
+            if (!softLimitReached && totalTurns >= maxTurns) {
+              softLimitReached = true;
+              session.steer(TURN_LIMIT_MESSAGE);
+            } else if (softLimitReached && totalTurns >= maxTurns + graceTurns) {
+              aborted = true;
+              session.abort();
+            }
+          }
+        }
         if (event.type === "tool_execution_start") options.onToolActivity?.({ type: "start", toolName: event.toolName });
         if (event.type === "tool_execution_end") options.onToolActivity?.({ type: "end", toolName: event.toolName });
         if (event.type === "message_end" && event.message.role === "assistant") {
@@ -1299,17 +1410,31 @@ export async function resumeAgent(
     : () => {};
 
   try {
+    // Same as runAgent: a resumed segment whose budget is already spent gets its
+    // wrap-up steering up front, so the first turn_end can abort rather than
+    // spending a free turn latching the soft limit.
+    if (maxTurns != null && turnOffset >= maxTurns) {
+      softLimitReached = true;
+      await session.steer(TURN_LIMIT_MESSAGE);
+    }
     await session.prompt(prompt);
   } finally {
+    checkpoint?.restore();
     collector.unsubscribe();
     cleanupGeneration();
     unsubEvents();
     cleanupAbort();
   }
 
+  // A paused segment reports neither a failure nor an abort: it stopped because
+  // the caller asked it to, and the session is waiting to be resumed.
+  const paused = checkpoint?.paused ?? false;
   return {
     text: collector.getText().trim() || getLastAssistantText(session, startLen),
-    failure: finalTurnError(session, startLen),
+    failure: paused ? undefined : finalTurnError(session, startLen),
+    ...(paused ? { paused } : {}),
+    ...(aborted ? { aborted } : {}),
+    ...(softLimitReached ? { steered: softLimitReached } : {}),
   };
 }
 
