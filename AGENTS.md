@@ -14,7 +14,7 @@
 - Read files in full before wide-ranging changes, before editing files you have not fully inspected, and when asked to investigate or audit. Do not rely on search snippets for broad changes.
 - No `any` unless absolutely necessary.
 - Inline single-line helpers that have only one call site.
-- Check `node_modules` for external API types (`@earendil-works/pi-*`, `@sinclair/typebox`, etc.); don't guess.
+- Check `node_modules` for external API types (`@earendil-works/pi-*`, `typebox`, etc.); don't guess.
 - **No inline imports** (`await import()`, `import("pkg").Type`, dynamic type imports). Top-level imports only.
 - Never remove or downgrade code to fix type errors from outdated deps; upgrade the dep instead.
 - Match the surrounding code style — it is enforced by biome (`biome.json`).
@@ -36,6 +36,8 @@ Read the file that covers a surface before changing its behavior; update it in t
 | `SECURITY.md` | Vulnerability reporting. |
 
 `README.md` holds the reference tables and links out; `docs/` holds the long-form guides. Each guide states its audience in its first three lines — read that before deciding it is the wrong file. Renaming an event, an RPC channel, a reply-envelope field, or a workflow global is a docs change too.
+
+Cite code by symbol or quoted string (`spawnTopLevel` in `src/index.ts`), never by line number: line numbers go stale on any edit above them.
 
 ## Commands
 
@@ -146,6 +148,7 @@ Before a release:
   ```
   `PI_E2E_LIVE=1` swaps the scripted faux suite for the live one (the faux suite is `skipIf(LIVE)`).
   (`prepublishOnly` runs lint + typecheck + test + build; the live e2e is the smoke test to run by hand before publishing.)
+- Inspect the publish tarball with `npm pack --dry-run` and eyeball the output: the version is right, `src/` (pi loads `pi.extensions: ./src/index.ts`), `dist/`, `README.md`, `CHANGELOG.md` and `LICENSE` are present, and nothing stray slipped past `.npmignore`. Read-only; it writes no tarball. `prepublishOnly` builds but never checks what actually ships.
 
 **Never publish.** The user runs `npm version` / `npm publish` and any tagging manually. Do not run those commands unless the user explicitly asks.
 

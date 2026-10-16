@@ -19,6 +19,11 @@ const { createAgentSession, loaderOptions, session } = vi.hoisted(() => ({
 vi.mock("@earendil-works/pi-coding-agent", () => ({
   createAgentSession,
   defineTool: (definition: unknown) => definition,
+  // The runner forwards these to the child loader's `extensionFactories`.
+  // Stubbed to the shape pi returns: a factory that registers nothing.
+  createMcpExtension: () => () => {},
+  createCodemodeExtension: () => () => {},
+  createToolSearchExtension: () => () => {},
   // agent-types.ts derives BUILTIN_TOOL_NAMES from these factories' `.name`s.
   createCodingTools: () => ["read", "bash", "edit", "write"].map((name) => ({ name })),
   createReadOnlyTools: () => ["read", "grep", "find", "ls"].map((name) => ({ name })),
@@ -171,6 +176,10 @@ describe("runner shared instruction injection", () => {
       cwd: dir,
       modelRegistry: { find: () => undefined, getAvailable: () => [] },
       getSystemPrompt: () => "Parent identity.",
+      // pi's project-trust gate: the runner forwards it to the child's
+      // SettingsManager. These cases all load the shared rules file, which is
+      // exactly the trusted-project behaviour under test.
+      isProjectTrusted: () => true,
     } as unknown as ExtensionContext;
   }
 

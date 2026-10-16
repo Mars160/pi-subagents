@@ -33,6 +33,11 @@ const {
 
 vi.mock("@earendil-works/pi-coding-agent", () => ({
   createAgentSession,
+  // The runner forwards these to the child loader's `extensionFactories`. Stubbed
+  // to the shape pi returns: a factory that registers nothing.
+  createMcpExtension: () => () => {},
+  createCodemodeExtension: () => () => {},
+  createToolSearchExtension: () => () => {},
   // Identity, as pi's own is: `defineTool` exists for the type inference, and
   // the structured-output tool is built through it.
   defineTool: (definition: unknown) => definition,
@@ -178,6 +183,7 @@ function createSession(finalText: string) {
       const opts = createAgentSession.mock.calls[0]?.[0];
       return opts ? mockRegistry(opts).map((name) => ({ name })) : [];
     }),
+    getToolDefinition: vi.fn((_name: string): Record<string, unknown> | undefined => undefined),
     // pi's Agent; `beforeToolCall` is an optional, assignable hook the scope
     // installer wraps to block out-of-scope calls on turn 1.
     agent: {
@@ -203,6 +209,7 @@ const ctx = {
   model: undefined,
   modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
   getSystemPrompt: vi.fn(() => "parent prompt"),
+  isProjectTrusted: vi.fn(() => true),
   sessionManager: {
     getBranch: vi.fn(() => []),
     getSessionFile: vi.fn(() => "/sessions/parent.jsonl"),
@@ -266,7 +273,7 @@ describe("agent-runner final output capture", () => {
       cwd: "/tmp/worktree",
       agentDir: "/mock/agent-dir",
     }));
-    expect(settingsManagerCreate).toHaveBeenCalledWith("/tmp/worktree", "/mock/agent-dir");
+    expect(settingsManagerCreate).toHaveBeenCalledWith("/tmp/worktree", "/mock/agent-dir", { projectTrusted: true });
     // Same claim as before `rememberAgents` flipped the default — the effective
     // cwd reaches the session manager — now via the persistent constructor.
     expect(sessionManagerCreate).toHaveBeenCalledWith("/tmp/worktree", undefined, expect.anything());
@@ -274,6 +281,61 @@ describe("agent-runner final output capture", () => {
       cwd: "/tmp/worktree",
       agentDir: "/mock/agent-dir",
     }));
+  });
+
+  it("carries the parent's project-trust decision into the child's settings and loader", async () => {
+    const { session } = createSession("UNTRUSTED");
+    createAgentSession.mockResolvedValue({ session });
+    ctx.isProjectTrusted.mockReturnValueOnce(false);
+
+    await runAgent(ctx, "Explore", "go", { pi });
+
+    expect(settingsManagerCreate).toHaveBeenCalledWith(expect.any(String), "/mock/agent-dir", { projectTrusted: false });
+    // One manager for both, so the loader and the session agree on what loads.
+    const settingsManager = settingsManagerCreate.mock.results[0].value;
+    expect(lastLoaderOpts().settingsManager).toBe(settingsManager);
+    expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({ settingsManager }));
+  });
+
+  it("a cross-directory spawn keeps the parent project's settings but reports its cwd untrusted", async () => {
+    const { session } = createSession("CROSS");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi, cwd: "/target", configCwd: "/project" });
+
+    // Both managers read the parent project's settings with the parent's trust…
+    expect(settingsManagerCreate).toHaveBeenCalledTimes(2);
+    for (const call of settingsManagerCreate.mock.calls) {
+      expect(call).toEqual(["/project", "/mock/agent-dir", { projectTrusted: true }]);
+    }
+    // …the loader's still loads the parent project's extensions, while the
+    // session's tells extensions (pi's MCP reading `<cwd>/.pi/mcp.json`) that
+    // its cwd is not a trusted project.
+    const loaderManager = lastLoaderOpts().settingsManager;
+    const sessionManager = createAgentSession.mock.calls[0][0].settingsManager;
+    expect(sessionManager).not.toBe(loaderManager);
+    expect(sessionManager.isProjectTrusted()).toBe(false);
+  });
+
+  it("forwards pi's built-in extensions to the child loader, as pi's CLI does", async () => {
+    // The child loader is built here, not by pi's CLI, so without these a
+    // `builtin:<name>` path resolves to nothing and MCP/codemode never load.
+    const { session } = createSession("BUILTINS");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "Say BUILTINS", { pi });
+
+    const factories = lastLoaderOpts().extensionFactories as Array<{
+      name: string;
+      factory: unknown;
+      builtin?: boolean;
+      replaceable?: boolean;
+    }>;
+    expect(factories.map((f) => f.name)).toEqual(["codemode", "tool-search", "mcp"]);
+    for (const f of factories) {
+      expect(f).toMatchObject({ builtin: true, replaceable: true });
+      expect(typeof f.factory).toBe("function");
+    }
   });
 
   it("forwards worktreeBase to the prompt builder, and omits it otherwise", async () => {
@@ -361,7 +423,7 @@ describe("agent-runner final output capture", () => {
   it("resumeAgent also falls back to the final assistant message text", async () => {
     const { session } = createSession("RESUMED");
 
-    const result = await resumeAgent(session as any, "Continue");
+    const result = await resumeAgent(session as any, "Continue", { type: "Explore" });
 
     expect(result.text).toBe("RESUMED");
     expect(result.failure).toBeUndefined();
@@ -492,7 +554,7 @@ describe("agent-runner failed-final-turn detection (#144)", () => {
       session.messages.push(errorFinal);
     }) as any;
 
-    const result = await resumeAgent(session as any, "Continue");
+    const result = await resumeAgent(session as any, "Continue", { type: "Explore" });
 
     expect(result.failure).toBe("retries exhausted: 529 overloaded");
   });
@@ -509,7 +571,7 @@ describe("agent-runner failed-final-turn detection (#144)", () => {
       session.messages.push({ role: "user", content: "follow-up" }, errorFinal);
     }) as any;
 
-    const result = await resumeAgent(session as any, "follow-up");
+    const result = await resumeAgent(session as any, "follow-up", { type: "Explore" });
 
     expect(result.failure).toBe("retries exhausted: 529 overloaded");
     expect(result.text).toBe(""); // NOT "PREVIOUS ANSWER"
@@ -528,7 +590,7 @@ describe("agent-runner failed-final-turn detection (#144)", () => {
       );
     }) as any;
 
-    const result = await resumeAgent(session as any, "go");
+    const result = await resumeAgent(session as any, "go", { type: "Explore" });
 
     expect(result.failure).toBe("retries exhausted: 529 overloaded");
     expect(result.text).toBe("new partial"); // this resume's progress, not the prior answer
@@ -633,6 +695,7 @@ describe("agent-runner usage callback wiring", () => {
     });
 
     await resumeAgent(session as any, "continue", {
+      type: "Explore",
       onAssistantUsage: (u) => seen.push(u),
     });
 
@@ -781,7 +844,6 @@ function makeAgentConfig(overrides: Record<string, unknown> = {}) {
     promptMode: "replace" as const,
     inheritContext: false,
     runInBackground: false,
-    isolated: false,
     ...overrides,
   };
 }
@@ -1604,6 +1666,29 @@ describe("agent-runner async extension tool registration", () => {
     expect(session.getActiveToolNames()).toContain("mcp_search");
   });
 
+  it("a deferred tool stays inactive until activated, then survives turn_end", async () => {
+    setup();
+    withExtensions({ "/ext/mcp.ts": ["mcp__srv__lookup"] });
+    const { session, listeners } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    // pi's MCP registers server tools with non-declared exposure by default.
+    const registry = session.getAllTools.getMockImplementation();
+    session.getAllTools.mockImplementation(() =>
+      (registry?.() ?? []).map((t: { name: string }) =>
+        t.name === "mcp__srv__lookup" ? { ...t, exposure: "deferred" } : t,
+      ),
+    );
+
+    await runAgent(ctx, "Explore", "go", { pi });
+    expect(session.getActiveToolNames()).not.toContain("mcp__srv__lookup");
+
+    // tool_search loads it mid-run; the next renarrow must not take it back.
+    session.setActiveToolsByName([...session.getActiveToolNames(), "mcp__srv__lookup"]);
+    for (const l of listeners) l({ type: "turn_end" });
+
+    expect(session.getActiveToolNames()).toContain("mcp__srv__lookup");
+  });
+
   it("ext: admits a late tool from the selected extension but not from others", async () => {
     setup({ extSelectors: ["ext:foo"] });
     withExtensions({ "/ext/foo.ts": [], "/ext/bar.ts": [] });
@@ -1681,7 +1766,7 @@ describe("agent-runner async extension tool registration", () => {
     createAgentSession.mockResolvedValue({ session });
 
     await runAgent(ctx, "Explore", "go", { pi });
-    await resumeAgent(session as any, "keep going");
+    await resumeAgent(session as any, "keep going", { type: "Explore" });
 
     registerLate("/ext/foo.ts", "foo_late");
     registerLate("/ext/bar.ts", "bar_late");
@@ -1877,6 +1962,26 @@ describe("agent-runner extension allowlist", () => {
     expect(tools).not.toContain("other_tool");
   });
 
+  it("['builtin:mcp'] keeps pi's built-in MCP and drops the other built-ins", async () => {
+    setupArrayAgent(["builtin:mcp"]);
+    withExtensions({
+      "builtin:mcp": ["mcp_builtin_tool"],
+      "builtin:codemode": ["codemode"],
+      "/ext/mcp.ts": ["mcp_ext_tool"],
+    });
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    const onToolActivity = vi.fn();
+
+    await runAgent(ctx, "Explore", "go", { pi, onToolActivity });
+
+    const tools = lastToolsPassed();
+    expect(tools).toContain("mcp_builtin_tool");
+    expect(tools).not.toContain("codemode");
+    expect(tools).not.toContain("mcp_ext_tool");
+    expect(onToolActivity.mock.calls.map((c) => c[0]?.toolName).filter((n) => n?.startsWith("extension-error:"))).toEqual([]);
+  });
+
   it("matches a package-installed extension by its package short name, not just its src dir (#143)", async () => {
     // A package whose entry is `src/index.ts` canonicalizes to "src"; a child
     // agent must still be able to allowlist it by the package name.
@@ -2057,6 +2162,24 @@ describe("agent-runner exclude_extensions", () => {
     const tools = lastToolsPassed();
     expect(tools).not.toContain("notify_send");
     expect(tools).toContain("mcp_tool");
+    expect(extensionErrors(onToolActivity)).toEqual([]);
+  });
+
+  it("extensions: true + exclude builtin:mcp — pi's built-in MCP is dropped, no typo warning", async () => {
+    setupAgent({ extensions: true, excludeExtensions: ["builtin:mcp"] });
+    withExtensions({
+      "builtin:mcp": ["mcp_builtin_tool"],
+      "builtin:codemode": ["codemode"],
+    });
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    const onToolActivity = vi.fn();
+
+    await runAgent(ctx, "Explore", "go", { pi, onToolActivity });
+
+    const tools = lastToolsPassed();
+    expect(tools).not.toContain("mcp_builtin_tool");
+    expect(tools).toContain("codemode");
     expect(extensionErrors(onToolActivity)).toEqual([]);
   });
 
@@ -2264,6 +2387,7 @@ describe("agent-runner ext: tool selectors", () => {
     builtinToolNames: string[];
     extSelectors?: string[];
     disallowedTools?: string[];
+    isolated?: boolean;
   }) {
     vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: o.extensions }));
     vi.mocked(getAgentConfig).mockReturnValueOnce(
@@ -2271,6 +2395,7 @@ describe("agent-runner ext: tool selectors", () => {
         extensions: o.extensions,
         extSelectors: o.extSelectors,
         disallowedTools: o.disallowedTools,
+        isolated: o.isolated,
       }),
     );
     vi.mocked(getToolNamesForType).mockReturnValueOnce(o.builtinToolNames);
@@ -2410,6 +2535,48 @@ describe("agent-runner ext: tool selectors", () => {
     expect(tools).toContain("read");
     expect(tools).not.toContain("foo_tool");
     expect(lastLoaderOpts().noExtensions).toBe(true);
+  });
+
+  // Frontmatter is authoritative (README "Frontmatter is authoritative"): the
+  // agent file's `isolated` holds on every spawn path, not only the ones that
+  // resolve it before calling the runner. `@handle` mentions and RPC spawns
+  // pass no `isolated` at all.
+  describe("the agent file's `isolated` wins over the spawn option", () => {
+    function run(fileIsolated: boolean | undefined, optionIsolated: boolean | undefined) {
+      setupExtAgent({ extensions: true, builtinToolNames: ["read"], extSelectors: ["ext:foo"], isolated: fileIsolated });
+      withExtensions({ "/ext/foo.ts": ["foo_tool"] });
+      const { session } = createSession("OK");
+      createAgentSession.mockResolvedValue({ session });
+      return runAgent(ctx, "Explore", "go", { pi, isolated: optionIsolated });
+    }
+
+    it("isolated: true in the file applies when the spawn omits it", async () => {
+      await run(true, undefined);
+
+      expect(lastToolsPassed()).not.toContain("foo_tool");
+      expect(lastLoaderOpts().noExtensions).toBe(true);
+    });
+
+    it("isolated: true in the file overrides a spawn's isolated: false", async () => {
+      await run(true, false);
+
+      expect(lastToolsPassed()).not.toContain("foo_tool");
+      expect(lastLoaderOpts().noExtensions).toBe(true);
+    });
+
+    it("isolated: false in the file overrides a spawn's isolated: true", async () => {
+      await run(false, true);
+
+      expect(lastToolsPassed()).toContain("foo_tool");
+      expect(lastLoaderOpts().noExtensions).toBe(false);
+    });
+
+    it("the spawn option decides when the file leaves isolated unset", async () => {
+      await run(undefined, true);
+
+      expect(lastToolsPassed()).not.toContain("foo_tool");
+      expect(lastLoaderOpts().noExtensions).toBe(true);
+    });
   });
 
   it("ext: composes with a path-loaded extension via its canonical name", async () => {
@@ -2666,8 +2833,8 @@ describe("agent-runner turn limits", () => {
 
 /**
  * Turn checkpoints and the runner's side of them. The mock session drives the
- * SDK's control flow the way pi-agent-core does — turn_end, then the
- * `shouldStopAfterTurn` hook, then `_runAgentPrompt`'s post-run continuation —
+ * SDK's control flow the way pi-agent-core does — the `finishTurn` hook, then
+ * `turn_end`, then `_runAgentPrompt`'s post-run continuation —
  * so these assert what runAgent/resumeAgent DO with a pause rather than only
  * that the hook was installed. `test/turn-checkpoint.test.ts` covers the hook
  * itself; `test/pause-turns-e2e.test.ts` covers it against a real session.
@@ -2684,7 +2851,9 @@ describe("agent-runner turn checkpoints", () => {
   function createCheckpointSession() {
     const { session, listeners } = createSession("OK");
     const agent = session.agent as any;
-    agent.shouldStopAfterTurn = undefined;
+    // The checkpoint chains the SDK's own turn-boundary hook rather than
+    // replacing it, so start from none.
+    agent.finishTurn = undefined;
     agent.continue = vi.fn(async () => {});
     agent.hasQueuedMessages = vi.fn(() => false);
     return { session, agent, listeners };
@@ -2698,7 +2867,7 @@ describe("agent-runner turn checkpoints", () => {
     turns: number,
     opts: {
       toolResultsPerTurn?: number;
-      /** 1-based turns that die on a provider error: turn_end fires, the hook does not. */
+      /** 1-based provider-error turns: finishTurn runs, but its decision is ignored. */
       errorTurns?: number[];
       queueFollowUp?: boolean;
       lengthStop?: boolean;
@@ -2721,11 +2890,15 @@ describe("agent-runner turn checkpoints", () => {
           ? []
           : Array.from({ length: opts.toolResultsPerTurn ?? 1 }, () => ({ role: "toolResult" }));
         session.messages.push(message, ...toolResults);
+        // The SDK's order: `finishTurn` runs before `turn_end`, and an error stop
+        // runs it too — the decision is then ignored, because the error is a hard
+        // exit the session retries through `agent.continue`.
+        const decision = await agent.finishTurn?.({ message, toolResults, context: {}, newMessages: [] });
         for (const l of [...listeners]) l({ type: "turn_end" });
         lastError = isError;
         if (isError) return;
-        const stop = await agent.shouldStopAfterTurn?.({ message, toolResults, context: {}, newMessages: [] });
-        if (stop) return;
+        // `{ action: "end" }` is the checkpoint stopping the loop at this boundary.
+        if (decision?.action === "end") return;
         // An abort lands after the in-flight turn: the next one never starts.
         if (session.abort.mock.calls.length > 0) return;
       }
@@ -2768,7 +2941,7 @@ describe("agent-runner turn checkpoints", () => {
     // Stopped at a tool-results boundary, not mid-turn...
     expect(session.messages.at(-1)?.role).toBe("toolResult");
     // ...and nothing the checkpoint wrapped outlives the run.
-    expect(agent.shouldStopAfterTurn).toBeUndefined();
+    expect(agent.finishTurn).toBeUndefined();
   });
 
   it("lets the SDK's post-run continuation through when the run never paused", async () => {
@@ -2879,7 +3052,7 @@ describe("agent-runner turn checkpoints", () => {
     const result = await runAgent(ctx, "Explore", "go", { pi, pauseTurns: 0 });
 
     expect(result.paused).toBeUndefined();
-    expect(agent.shouldStopAfterTurn).toBeUndefined();
+    expect(agent.finishTurn).toBeUndefined();
   });
 
   it("resumes with a fresh interval and its own turn counter", async () => {
@@ -2903,9 +3076,12 @@ describe("agent-runner turn checkpoints", () => {
     // The text is this segment's own, and the run is not reported as a failure.
     expect(result.text).toBe("turn 2");
     expect(result.failure).toBeUndefined();
-    expect(result.steered).toBeUndefined();
+    // A paused segment reports neither outcome as a boolean flag: the run was
+    // neither steered nor aborted, it just stopped at the caller's interval.
+    expect(result.steered).toBe(false);
+    expect(result.aborted).toBe(false);
     expect(session.steer).not.toHaveBeenCalled();
-    expect(agent.shouldStopAfterTurn).toBeUndefined();
+    expect(agent.finishTurn).toBeUndefined();
   });
 
   it("does not pause a resume whose lifetime count already reached the cap", async () => {
@@ -2954,7 +3130,7 @@ describe("agent-runner turn checkpoints", () => {
 
     expect(result.paused).toBe(true);
     expect(turnsRun()).toBe(2);
-    expect(agent.shouldStopAfterTurn).toBeUndefined();
+    expect(agent.finishTurn).toBeUndefined();
   });
 
   it("wraps up before the prompt when the budget is already spent", async () => {
@@ -2997,7 +3173,60 @@ describe("agent-runner turn checkpoints", () => {
     const { session } = createSession("DONE");
     const result = await resumeAgent(session, "go");
 
-    expect(result).toEqual({ text: "DONE", failure: undefined });
+    expect(result).toEqual({ text: "DONE", failure: undefined, aborted: false, steered: false });
+  });
+});
+
+describe("agent-runner resumed turn limits", () => {
+  // #368 — a resumed run is the same kind of run as the first one: the same
+  // steer → grace → abort machine must bound it. resumeAgent wired only tool
+  // activity, usage and compaction, so a resumed agent had no turn limit at
+  // all and its widget counter never moved off turn 1.
+  describe("on resume (#368)", () => {
+    /** Resume a session whose prompt fires `turns` turn_end events, like runWithTurns. */
+    async function resumeWithTurns(turns: number, options: Partial<Parameters<typeof resumeAgent>[2]> = {}) {
+      const { session, listeners } = createSession("OK");
+      session.prompt.mockImplementation(async () => {
+        for (let i = 0; i < turns; i++) {
+          for (const l of [...listeners]) l({ type: "turn_end" });
+        }
+        session.messages.push({ role: "assistant", content: [{ type: "text", text: "OK" }] });
+      });
+      const result = await resumeAgent(session as any, "keep going", { type: "Explore", ...options });
+      return { session, result };
+    }
+
+    it("steers once on reaching the limit, and does not abort", async () => {
+      setGraceTurns(5);
+      const { session, result } = await resumeWithTurns(5, { maxTurns: 5 });
+      expect(session.steer).toHaveBeenCalledTimes(1);
+      expect(session.steer.mock.calls[0][0]).toContain("turn limit");
+      expect(session.abort).not.toHaveBeenCalled();
+      expect(result.steered).toBe(true);
+      expect(result.aborted).toBe(false);
+    });
+
+    it("hard-aborts once the grace turns are used up", async () => {
+      setGraceTurns(2);
+      const { session, result } = await resumeWithTurns(7, { maxTurns: 5 });
+      expect(session.steer).toHaveBeenCalledTimes(1);
+      expect(session.abort).toHaveBeenCalled();
+      expect(result.aborted).toBe(true);
+    });
+
+    it("does not steer or abort below the limit", async () => {
+      const { session, result } = await resumeWithTurns(3, { maxTurns: 5 });
+      expect(session.steer).not.toHaveBeenCalled();
+      expect(session.abort).not.toHaveBeenCalled();
+      expect(result.steered).toBe(false);
+      expect(result.aborted).toBe(false);
+    });
+
+    it("reports each resumed turn to the caller's counter", async () => {
+      const onTurnEnd = vi.fn();
+      await resumeWithTurns(3, { maxTurns: 10, onTurnEnd });
+      expect(onTurnEnd.mock.calls.map(c => c[0])).toEqual([1, 2, 3]);
+    });
   });
 });
 
@@ -3006,6 +3235,31 @@ describe("agent-runner turn checkpoints", () => {
 // nothing checked that the signal actually reaches the session, so a child could
 // be marked stopped while it keeps running and burning tokens.
 describe("agent-runner abort signal forwarding", () => {
+  // A signal that fired BEFORE the child was prompted. `addEventListener` never
+  // fires on an already-aborted signal, and pi's `session.abort()` is a no-op
+  // until a run is active — so the only way to honor it is not to prompt.
+  it("does not prompt when the signal fired before session creation", async () => {
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+    const controller = new AbortController();
+    controller.abort();
+    const { session } = createSession("SHOULD NOT RUN");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi, signal: controller.signal });
+
+    expect(session.prompt).not.toHaveBeenCalled();
+  });
+
+  it("resumeAgent does not prompt when its signal is already aborted", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const { session } = createSession("SHOULD NOT RUN");
+
+    await resumeAgent(session as any, "continue", { type: "Explore", signal: controller.signal });
+
+    expect(session.prompt).not.toHaveBeenCalled();
+  });
+
   it("aborts the session when the parent signal fires mid-run", async () => {
     vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
     const controller = new AbortController();

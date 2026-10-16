@@ -38,7 +38,12 @@ const config: AgentConfig = {
   extensions: false, skills: false, promptMode: "replace", persistSession: false,
   model: "test/pinned",
 };
-const ctx = { cwd: "/tmp", model: pinnedModel, modelRegistry, getSystemPrompt: () => "Parent" } as unknown as ExtensionContext;
+const ctx = {
+  cwd: "/tmp", model: pinnedModel, modelRegistry, getSystemPrompt: () => "Parent",
+  // pi's project-trust gate: the runner forwards it to the child's
+  // SettingsManager. A test project is trusted, as pi's own default is.
+  isProjectTrusted: () => true,
+} as unknown as ExtensionContext;
 
 beforeEach(() => {
   vi.clearAllMocks();

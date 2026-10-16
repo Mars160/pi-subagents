@@ -1,4 +1,4 @@
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { resolveEffectiveEffort } from "./effort-policy.js";
 import { preferAgentFileModel } from "./model-policy.js";
 import type { AgentConfig, IsolationMode, JoinMode, ThinkingLevel } from "./types.js";

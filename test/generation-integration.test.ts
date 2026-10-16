@@ -38,6 +38,11 @@ const {
 vi.mock("@earendil-works/pi-coding-agent", () => ({
   createAgentSession,
   defineTool: (definition: unknown) => definition,
+  // The runner forwards these to the child loader's `extensionFactories`.
+  // Stubbed to the shape pi returns: a factory that registers nothing.
+  createMcpExtension: () => () => {},
+  createCodemodeExtension: () => () => {},
+  createToolSearchExtension: () => () => {},
   DefaultResourceLoader: class {
     constructor(options: unknown) {
       defaultResourceLoaderCtor(options);
@@ -233,6 +238,9 @@ const ctx = {
   model: undefined,
   modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
   getSystemPrompt: vi.fn(() => "parent prompt"),
+  // pi's project-trust gate: the runner forwards it to the child's
+  // SettingsManager. A test project is trusted, as pi's own default is.
+  isProjectTrusted: vi.fn(() => true),
   sessionManager: {
     getBranch: vi.fn(() => []),
     getSessionFile: vi.fn(() => "/sessions/parent.jsonl"),

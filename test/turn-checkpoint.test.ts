@@ -4,10 +4,10 @@
  * `createFakeSdk` drives the control flow of the installed pi-agent-core rather
  * than a plain object mock, because the ORDER is the whole point:
  *
- *   agent-loop.js      run a turn → emit `turn_end` → (an error stop returns
- *                      here, so the hook never runs) → ask
- *                      `shouldStopAfterTurn({message, toolResults, …})` → stop
- *                      when it says so.
+ *   agent-loop.js      run a turn → ask `finishTurn({message, toolResults, …})`
+ *                      → emit `turn_end` → stop when it returns `{action:"end"}`.
+ *                      An error/aborted stop calls the hook too, but ignores its
+ *                      decision and returns.
  *   agent-session.js   `_runAgentPrompt`: `await agent.prompt()`, then
  *                      `while (await _handlePostAgentRun()) await agent.continue()`,
  *                      where the handler continues on its own for a retryable
@@ -27,15 +27,18 @@ import {
   type TurnCheckpointOptions,
 } from "../src/turn-checkpoint.js";
 
+/** The SDK's turn-boundary hook, keyed off the public session type. */
+type FinishTurn = NonNullable<AgentSession["agent"]["finishTurn"]>;
+
 /** The context the SDK hands the turn hook. */
-type TurnBoundary = Parameters<NonNullable<AgentSession["agent"]["shouldStopAfterTurn"]>>[0];
+type TurnBoundary = Parameters<FinishTurn>[0];
 
 interface FakeOptions {
   /** Turns a prompt runs when nothing stops it. */
   turns: number;
   /** Tool results each turn produces. 0 = a plain text completion. */
   toolResultsPerTurn?: number;
-  /** 1-based turns that end in a provider error: `turn_end` fires, the hook does not. */
+  /** 1-based turns that end in a provider error: the hook runs, its decision is ignored. */
   errorTurns?: number[];
   /** Let the post-run handler retry an error turn through `agent.continue()`. */
   retryErrors?: boolean;
@@ -68,8 +71,8 @@ function createFakeSdk(options: FakeOptions) {
   const listeners: Array<(event: unknown) => void> = [];
   const messages: Array<{ role: string }> = [];
 
-  // `continue`/`hasQueuedMessages` are prototype methods and
-  // `shouldStopAfterTurn` is an own field on the real Agent — same shape here.
+  // `continue`/`hasQueuedMessages` are prototype methods and `finishTurn` is an
+  // own field on the real Agent — same shape here.
   const agent = Object.create({
     async continue() {
       state.continueCalls += 1;
@@ -78,11 +81,11 @@ function createFakeSdk(options: FakeOptions) {
     },
     hasQueuedMessages: () => queued.length > 0,
   }) as {
-    shouldStopAfterTurn?: (context: TurnBoundary, signal?: AbortSignal) => boolean | Promise<boolean>;
+    finishTurn?: FinishTurn;
     continue: () => Promise<void>;
     hasQueuedMessages: () => boolean;
   };
-  agent.shouldStopAfterTurn = undefined;
+  agent.finishTurn = undefined;
 
   const settingsManager = {
     compaction,
@@ -91,10 +94,9 @@ function createFakeSdk(options: FakeOptions) {
 
   let lastAssistantMessage: { role: string; stopReason?: string } | undefined;
 
-  /** agent-loop.js's runLoop: turns until an error stop or the turn hook stops it. */
+  /** agent-loop.js's runLoop: turns until the turn hook ends them or an error stop returns. */
   async function runTurns() {
     while (state.totalTurns < options.turns) {
-      state.segmentTurns += 1;
       state.totalTurns += 1;
       const isError = (options.errorTurns ?? []).includes(state.totalTurns);
       const message = { role: "assistant", stopReason: isError ? "error" : "toolUse", content: [] };
@@ -103,14 +105,17 @@ function createFakeSdk(options: FakeOptions) {
         : Array.from({ length: options.toolResultsPerTurn ?? 1 }, () => ({ role: "toolResult" }));
       messages.push(message, ...toolResults);
       lastAssistantMessage = message;
-      for (const listener of [...listeners]) listener({ type: "turn_end" });
-      // An error stop returns before the hook, exactly as pi does.
-      if (isError) return;
-      const stop = await agent.shouldStopAfterTurn?.(
+      // The hook runs before `turn_end`, and an error stop runs it too.
+      const decision = await agent.finishTurn?.(
         { message, toolResults, context: {}, newMessages: [] } as unknown as TurnBoundary,
         undefined,
       );
-      if (stop) return;
+      // The caller's counter is the `turn_end` count, so it advances after the hook.
+      state.segmentTurns += 1;
+      for (const listener of [...listeners]) listener({ type: "turn_end" });
+      // An error stop returns without honoring the decision, exactly as pi does.
+      if (isError) return;
+      if (decision?.action === "end") return;
     }
   }
 
@@ -242,6 +247,20 @@ describe("installTurnCheckpoint", () => {
     checkpoint.restore();
   });
 
+  it("pauses on a tool-less turn the session itself is continuing", async () => {
+    // A `turn_end` handler that asked for a continue means another request
+    // follows, so the run is not over and the checkpoint may still pause.
+    const fake = createFakeSdk({ turns: 3, toolResultsPerTurn: 0 });
+    fake.agent.finishTurn = vi.fn(async () => ({ action: "continue" as const }));
+    const checkpoint = install(fake, 1);
+
+    await fake.session.prompt();
+
+    expect(checkpoint.paused).toBe(true);
+    expect(fake.state.totalTurns).toBe(1);
+    checkpoint.restore();
+  });
+
   it("pauses on a text-only turn while the SDK still has queued work", async () => {
     // A steering message queued mid-stream means the loop was going to run again,
     // so the run is not over and the checkpoint still applies.
@@ -264,8 +283,8 @@ describe("installTurnCheckpoint", () => {
 
   it("counts the caller's turns, not its own hook calls", async () => {
     // Two turns die on a provider error: `turn_end` fires (the runner counts
-    // them) but the hook never runs. The third counted turn is the interval, so
-    // the pause lands there — with a hook-only count the run would never pause.
+    // them) but the hook skips them. The third counted turn is the interval, so
+    // the pause lands there — with a hook-only count it would land a turn late.
     const fake = createFakeSdk({ turns: 4, errorTurns: [1, 2], retryErrors: true });
     const checkpoint = install(fake, 3);
 
@@ -311,11 +330,11 @@ describe("installTurnCheckpoint", () => {
     const controller = new AbortController();
     controller.abort();
 
-    const stopped = await fake.agent.shouldStopAfterTurn?.(
+    const stopped = await fake.agent.finishTurn?.(
       { toolResults: [{}] } as unknown as TurnBoundary, controller.signal,
     );
 
-    expect(stopped).toBe(false);
+    expect(stopped).toBeUndefined();
     expect(checkpoint.paused).toBe(false);
     expect(onPause).not.toHaveBeenCalled();
     checkpoint.restore();
@@ -335,8 +354,8 @@ describe("installTurnCheckpoint", () => {
 
   it("lets an already-installed hook stop the run without calling it a pause", async () => {
     const fake = createFakeSdk({ turns: 6 });
-    const external = vi.fn(async () => true);
-    fake.agent.shouldStopAfterTurn = external;
+    const external = vi.fn(async () => ({ action: "end" as const }));
+    fake.agent.finishTurn = external;
     const onPause = vi.fn();
     const checkpoint = install(fake, 2, { onPause });
 
@@ -351,8 +370,8 @@ describe("installTurnCheckpoint", () => {
 
   it("keeps chaining to a hook that declines", async () => {
     const fake = createFakeSdk({ turns: 5 });
-    const external = vi.fn(async () => false);
-    fake.agent.shouldStopAfterTurn = external;
+    const external = vi.fn(async () => undefined);
+    fake.agent.finishTurn = external;
     const checkpoint = install(fake, 2);
 
     await fake.session.prompt();
@@ -456,7 +475,7 @@ describe("installTurnCheckpoint", () => {
     checkpoint.restore();
     checkpoint.restore();
 
-    expect(fake.agent.shouldStopAfterTurn).toBeUndefined();
+    expect(fake.agent.finishTurn).toBeUndefined();
     expect(fake.agent.continue).toBe(originalContinue);
     expect(fake.settingsManager.getCompactionSettings).toBe(originalSettings);
 
@@ -470,14 +489,15 @@ describe("installTurnCheckpoint", () => {
     const bare: { agent: Record<string, unknown>; messages: unknown[] } = { agent: {}, messages: [] };
     const checkpoint = installTurnCheckpoint(bare as unknown as AgentSession, { pauseTurns: 1 });
 
-    const stop = await (
-      bare.agent.shouldStopAfterTurn as (c: TurnBoundary) => boolean | Promise<boolean>
-    )({ toolResults: [{}] } as unknown as TurnBoundary);
+    const stop = await (bare.agent.finishTurn as FinishTurn)({
+      message: { stopReason: "toolUse" },
+      toolResults: [{}],
+    } as unknown as TurnBoundary);
 
-    expect(stop).toBe(true);
+    expect(stop).toEqual({ action: "end" });
     expect(checkpoint.paused).toBe(true);
     expect(() => checkpoint.restore()).not.toThrow();
-    expect(bare.agent.shouldStopAfterTurn).toBeUndefined();
+    expect(bare.agent.finishTurn).toBeUndefined();
     expect(bare.agent.continue).toBeUndefined();
   });
 

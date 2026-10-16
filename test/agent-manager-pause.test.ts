@@ -255,7 +255,9 @@ describe("turn checkpoints — lifecycle", () => {
   });
 
   it("applies a maxTurns override and inherits the stored ceiling otherwise", async () => {
-    const id = await pausedAgent(3);
+    // The spawn's invocation snapshot carries a ceiling of its own: a resume that
+    // fell back to it instead of the record would resurrect 20 after `d` clears it.
+    const id = await pausedAgent(3, { invocation: { maxTurns: 20 } });
     const resume = scriptResume();
 
     const raised = manager.resume(id, "b", undefined, { maxTurns: 50 });
@@ -271,8 +273,17 @@ describe("turn checkpoints — lifecycle", () => {
     // 0 is the runner's spelling for "no ceiling", so an explicit one clears it.
     const cleared = manager.resume(id, "d", undefined, { maxTurns: 0 });
     resume.pending.get("d")!({ turns: 1 });
-    expect(lastOptions(resume.calls).maxTurns).toBeUndefined();
+    // The runner gets the sentinel, not `undefined`: re-resolving that would
+    // re-apply the agent's config and the current project default.
+    expect(lastOptions(resume.calls).maxTurns).toBe(0);
     expect((await cleared)!.maxTurns).toBeUndefined();
+
+    // ...and it stays cleared for the next segment: the spawn's immutable
+    // invocation snapshot must not hand the old ceiling back.
+    const afterClear = manager.resume(id, "e");
+    resume.pending.get("e")!({ turns: 1 });
+    expect(lastOptions(resume.calls).maxTurns).toBe(0);
+    expect((await afterClear)!.maxTurns).toBeUndefined();
   });
 
   it("keeps a ceiling that was resolved as unlimited at spawn", async () => {
@@ -290,13 +301,14 @@ describe("turn checkpoints — lifecycle", () => {
     // or the cap it was asked to drop comes back on the first run.
     expect((vi.mocked(runAgent).mock.calls[0][3] as any).maxTurns).toBe(0);
 
-    // No override: the record keeps the ceiling it was created with. Re-resolving
-    // here would re-apply the current project default to a record that has none.
+    // No override: the record keeps the ceiling it was created with, and the
+    // runner gets 0 — `undefined` would re-resolve the project default against a
+    // record that has no ceiling.
     const resume = scriptResume();
     const resumed = manager.resume(id, "b");
     resume.pending.get("b")!({ paused: true, turns: 1 });
     await resumed;
-    expect(lastOptions(resume.calls).maxTurns).toBeUndefined();
+    expect(lastOptions(resume.calls).maxTurns).toBe(0);
   });
 
   it("refuses a second resume while a foreground resume is in flight", async () => {

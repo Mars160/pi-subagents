@@ -45,7 +45,12 @@ const modelRegistry = {
   getAvailable: () => [clampedModel],
   getAll: () => [clampedModel],
 };
-const ctx = { cwd: "/tmp", model: clampedModel, modelRegistry, getSystemPrompt: () => "Parent" } as unknown as ExtensionContext;
+const ctx = {
+  cwd: "/tmp", model: clampedModel, modelRegistry, getSystemPrompt: () => "Parent",
+  // pi's project-trust gate: the runner forwards it to the child's
+  // SettingsManager. A test project is trusted, as pi's own default is.
+  isProjectTrusted: () => true,
+} as unknown as ExtensionContext;
 
 const plainAgent: AgentConfig = {
   name: "plain", description: "No level of its own", systemPrompt: "Work.",

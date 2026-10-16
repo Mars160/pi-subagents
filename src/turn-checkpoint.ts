@@ -1,9 +1,10 @@
 /**
  * turn-checkpoint.ts — stop an agent session at a turn boundary, resumably.
  *
- * The SDK's `shouldStopAfterTurn` hook runs after a turn's tools have executed:
- * a boundary `agent.continue()` can resume from. A checkpoint stops the loop
- * there once the caller's turn count reaches the interval.
+ * The SDK's `finishTurn` hook runs after a turn's assistant message and tool
+ * results, immediately before `turn_end`: a boundary `agent.continue()` can
+ * resume from. Returning `{ action: "end" }` ends the loop there once the
+ * caller's turn count reaches the interval.
  *
  * Stopping the loop is not enough. `AgentSession._runAgentPrompt` continues the
  * run itself (`while (await this._handlePostAgentRun()) await this.agent.continue()`)
@@ -29,10 +30,7 @@ export function normalizePauseTurns(turns: number | undefined): number | undefin
 }
 
 /** The SDK's turn-boundary hook, keyed off the public session type so a pi bump surfaces here. */
-type ShouldStopAfterTurn = NonNullable<AgentSession["agent"]["shouldStopAfterTurn"]>;
-
-/** The context the SDK hands that hook at the end of a turn. */
-type TurnBoundary = Parameters<ShouldStopAfterTurn>[0];
+type FinishTurn = NonNullable<AgentSession["agent"]["finishTurn"]>;
 
 /** The subset of `SettingsManager` the checkpoint touches. */
 type CompactionSettingsSource = { getCompactionSettings?: () => CompactionSettings };
@@ -46,10 +44,10 @@ export interface TurnCheckpointOptions {
   pauseTurns: number;
   /**
    * Turns this segment has completed, as the caller counts them. Pass the same
-   * counter `maxTurns` is enforced against — the runner counts every `turn_end`,
-   * including turns this hook never sees because they ended in a provider error,
-   * so a pause lands on the turn the caller counts as the interval-th.
-   * Defaults to counting this hook's own invocations.
+   * counter `maxTurns` is enforced against — the runner counts every `turn_end`.
+   * This hook runs before that event, so the caller's count is one short of the
+   * turn being decided and the checkpoint compares `getTurnCount() + 1` to the
+   * interval. Defaults to counting this hook's own invocations.
    */
   getTurnCount?: () => number;
   /**
@@ -82,7 +80,7 @@ export function installTurnCheckpoint(
 ): TurnCheckpoint {
   const interval = Math.max(1, Math.floor(options.pauseTurns));
   const agent = session.agent;
-  const previousShouldStop = agent.shouldStopAfterTurn;
+  const previousFinishTurn = agent.finishTurn;
   const previousContinue = agent.continue;
 
   let paused = false;
@@ -104,23 +102,38 @@ export function installTurnCheckpoint(
     };
   };
 
-  const hook: ShouldStopAfterTurn = async (context: TurnBoundary, signal) => {
-    // Chain, don't override: a run another hook stops keeps stopping, and that
-    // is a stop rather than a pause (there is nothing to resume from).
-    if (previousShouldStop && (await previousShouldStop(context, signal))) return true;
-    if (signal?.aborted) return false;
+  const hook: FinishTurn = async (turn, signal) => {
+    // Chain, don't override: the session's own hook still dispatches `turn_end`
+    // boundaries, and its decision outranks ours.
+    const previousDecision = (await previousFinishTurn?.(turn, signal)) ?? undefined;
+    // A run another hook ends keeps ending, and that is a stop rather than a
+    // pause (there is nothing to resume from).
+    if (previousDecision?.action === "end") return previousDecision;
+    // An explicit continue promises one more request, so a tool-less turn is not
+    // the end of the run and may still be paused.
+    const explicitContinue = previousDecision?.action === "continue";
+    // Error and aborted turns are hard exits the loop takes regardless of this
+    // decision, and the session retries them itself: leave them alone.
+    if (signal?.aborted || turn.message.stopReason === "error" || turn.message.stopReason === "aborted") {
+      return previousDecision;
+    }
     hookTurns += 1;
-    if (options.shouldPause && !options.shouldPause()) return false;
-    if (turnCount() < interval) return false;
-    // A turn with no tool results and nothing queued is the end of the run:
-    // pausing there would report a finished run as paused.
-    if (context.toolResults.length === 0 && !agent.hasQueuedMessages()) return false;
+    // This hook runs before `turn_end`, so a caller counting those events has
+    // not counted the turn being decided yet.
+    const counted = options.getTurnCount ? turnCount() + 1 : hookTurns;
+    if (options.shouldPause && !options.shouldPause()) return previousDecision;
+    if (counted < interval) return previousDecision;
+    // A turn with no tool results, nothing queued and no forced continuation is
+    // the end of the run: pausing there would report a finished run as paused.
+    if (!explicitContinue && turn.toolResults.length === 0 && !agent.hasQueuedMessages()) {
+      return previousDecision;
+    }
     paused = true;
     suppressCompaction();
     options.onPause?.();
-    return true;
+    return { action: "end" };
   };
-  agent.shouldStopAfterTurn = hook;
+  agent.finishTurn = hook;
 
   if (previousContinue) {
     agent.continue = async () => {
@@ -139,7 +152,7 @@ export function installTurnCheckpoint(
     restore() {
       if (restored) return;
       restored = true;
-      agent.shouldStopAfterTurn = previousShouldStop;
+      agent.finishTurn = previousFinishTurn;
       if (previousContinue) agent.continue = previousContinue;
       restoreCompaction?.();
     },
