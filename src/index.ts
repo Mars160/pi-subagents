@@ -3349,6 +3349,59 @@ Terse command-style prompts produce shallow, generic work.
     },
   }));
 
+  // ---- stop_subagent tool ----
+
+  registerToolReportingUsage(defineTool({
+    name: SUBAGENT_TOOL_NAMES.STOP,
+    label: "Stop Agent",
+    description:
+      "Stop a top-level agent. Cancellation is requested: a running agent reports \"stopped\" at once and its run winds " +
+      "down afterwards; a queued agent is removed from the queue and never starts; a paused agent is stopped with the " +
+      "resources it was holding released. " +
+      "Only this session's own agents can be stopped — a nested child or a workflow agent reports through its owner. " +
+      "Whatever the agent produced before stopping stays readable with get_subagent_result.",
+    promptSnippet: "Stop a top-level running, queued, or paused agent",
+    parameters: Type.Object({
+      agent_id: Type.String({
+        description: "The agent ID to stop. The agent's handle also works — its `name` if you gave it one, otherwise its type (`explore`, `explore-2`).",
+      }),
+    }),
+    execute: async (_toolCallId, params, _signal, _onUpdate, _ctx) => {
+      const record = resolveAgentRef(params.agent_id);
+      if (!record || !isTopLevelAgent(record)) {
+        return textResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
+      }
+
+      const priorStatus = record.status;
+      if (!manager.abort(record.id)) {
+        return textResult(
+          `Agent "${params.agent_id}" is not running (status: ${priorStatus}). Nothing to stop.`,
+        );
+      }
+
+      // The caller asked for the stop it is being told about, so the completion
+      // notification for it would announce work the model just cancelled — the
+      // same suppression get_subagent_result applies to a result it returns.
+      // Set before the run settles: `onComplete` reads the flag at delivery.
+      record.resultConsumed = true;
+
+      // `abort()` only requests the stop: a running agent's status flips now,
+      // but the run winds down on its own schedule and the record only reaches
+      // its final shape in the run's settle path.
+      const detail = priorStatus === "queued"
+        ? "It was removed from the queue and will never start."
+        : priorStatus === "paused"
+          ? "The session and any worktree copy it was holding are released, so it will not continue on its own."
+          : "The run may take a moment to wind down, but it will not start another turn.";
+
+      return textResult(
+        `Stopped agent ${record.id} (${record.description}) — ${priorStatus} → stopped.\n` +
+        `${detail}\n` +
+        `No completion notification will follow; call get_subagent_result with "${record.id}" if you need what it produced before stopping.`,
+      );
+    },
+  }));
+
   // ---- /agents interactive menu ----
 
   // Directory resolution and the frontmatter edits live in agent-file-toggle.ts
